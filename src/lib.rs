@@ -15,6 +15,7 @@ pub mod profile;
 pub mod python;
 pub mod remote_sync;
 pub mod s3;
+pub mod s3_role;
 pub mod shuffle;
 pub mod storage;
 pub mod tensor;

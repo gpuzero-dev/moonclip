@@ -26,9 +26,15 @@
 //!
 //! * **Temporary credentials** *are* covered since 0.2: a session token
 //!   ([`S3Config::session_token`]) goes into every signature, which is what
-//!   short-lived credentials scoped to a prefix need. Refreshing them is the
-//!   caller's: one that expires mid-run fails like a wrong key. Checked on
-//!   R2 itself, where a listing needs the token in a header (0.2.1).
+//!   short-lived credentials scoped to a prefix need. Checked on R2 itself,
+//!   where a listing needs the token in a header (0.2.1). Given as keys,
+//!   refreshing them is the caller's: one that expires mid-run fails like a
+//!   wrong key. Found from a role - the instance's, the container's, a web
+//!   identity - they are fetched again before they expire
+//!   ([`crate::s3_role`], GPU-309).
+//! * **Encryption** is the bucket's: its default encryption, SSE-S3 or
+//!   SSE-KMS, applies to every object written here. No per-request
+//!   `x-amz-server-side-encryption` header is sent.
 //! * **Very large objects.** Handled, but by a second path worth knowing
 //!   about: past `SINGLE_PUT_LIMIT` a write becomes a multipart upload rather
 //!   than one `PUT`, because S3 refuses a single `PUT` over 5 GiB and a
@@ -82,6 +88,10 @@ pub struct S3Config {
     /// values rather than two: S3's `AssumeRole`, or R2's temporary
     /// credentials scoped to a prefix. None for a long-lived key.
     pub session_token: Option<String>,
+    /// A role whose credentials are fetched as they are needed, in place of
+    /// the three fields above, which are then empty (GPU-309). See
+    /// [`signing`].
+    pub role: Option<std::sync::Arc<crate::s3_role::RoleCredentials>>,
     /// Use path-style URLs (required for MinIO, optional for AWS).
     /// If true:  http://endpoint/bucket/key
     /// If false: http://bucket.endpoint/key (virtual-hosted)
@@ -207,6 +217,75 @@ impl S3Credentials {
     }
 }
 
+/// What a bucket is signed with: keys, or a role whose keys are fetched when
+/// they are needed (GPU-309).
+pub enum Signing {
+    Keys(S3Credentials),
+    Role(std::sync::Arc<crate::s3_role::RoleCredentials>),
+}
+
+impl Signing {
+    /// The fields of an [`S3Config`]: the keys, or empty keys and the role.
+    pub fn into_parts(
+        self,
+    ) -> (String, String, Option<String>, Option<std::sync::Arc<crate::s3_role::RoleCredentials>>) {
+        match self {
+            Signing::Keys(k) => (k.access_key, k.secret_key, k.session_token, None),
+            Signing::Role(role) => (String::new(), String::new(), None, Some(role)),
+        }
+    }
+}
+
+/// Keys given, else the environment's ([`S3Credentials::resolve`]), else a
+/// profile in the shared credentials file, else the machine's role
+/// ([`crate::s3_role`]). A role is asked once here, so a machine without
+/// one fails now, with both reasons, rather than at the first save.
+pub fn signing(
+    access_key: Option<&str>,
+    secret_key: Option<&str>,
+    session_token: Option<&str>,
+) -> Result<Signing> {
+    signing_with(access_key, secret_key, session_token, |name| std::env::var(name).ok())
+}
+
+/// [`signing`] with the environment as a function.
+pub fn signing_with(
+    access_key: Option<&str>,
+    secret_key: Option<&str>,
+    session_token: Option<&str>,
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<Signing> {
+    let given = |v: Option<&str>| v.is_some_and(|v| !v.is_empty());
+    let resolved = S3Credentials::resolve_with(access_key, secret_key, session_token, &var);
+    // Keys given are the caller's decision, right or wrong: never replaced by
+    // whatever else the machine has.
+    if resolved.is_ok() || given(access_key) || given(secret_key) {
+        return resolved.map(Signing::Keys);
+    }
+    if let Some(keys) = crate::s3_role::profile_keys(&var) {
+        return Ok(Signing::Keys(keys));
+    }
+    let Err(no_keys) = resolved else { unreachable!("handled above") };
+    let Some(source) = crate::s3_role::detect(&var) else {
+        return Err(no_keys);
+    };
+    let role = crate::s3_role::RoleCredentials::new(source);
+    // The two reasons as one sentence, without each one's own "Invalid
+    // configuration:" in front.
+    let bare = |e: MoonclipError| match e {
+        MoonclipError::Config(m) | MoonclipError::Storage(m) => m,
+        other => other.to_string(),
+    };
+    match role.get() {
+        Ok(_) => Ok(Signing::Role(std::sync::Arc::new(role))),
+        Err(e) => Err(MoonclipError::Config(format!(
+            "{}, nor a profile in ~/.aws/credentials; and no role either: {}",
+            bare(no_keys),
+            bare(e)
+        ))),
+    }
+}
+
 // ─── Addressing and signing ─────────────────────────────────────────
 
 /// How long a signed request stays valid. It is signed the moment it is
@@ -300,6 +379,19 @@ impl S3Storage {
         })
     }
 
+    /// The keys to sign with now: the ones given, or the role's current
+    /// ones, fetched again when they are about to expire.
+    fn credentials(&self) -> std::result::Result<Credentials, MoonclipError> {
+        let Some(role) = &self.config.role else {
+            return Ok(self.credentials.clone());
+        };
+        let keys = role.get()?;
+        Ok(match &keys.session_token {
+            Some(token) => Credentials::new_with_token(&keys.access_key, &keys.secret_key, token),
+            None => Credentials::new(&keys.access_key, &keys.secret_key),
+        })
+    }
+
     /// The address of one request to `key`, signed now: `rusty-s3`'s
     /// SigV4, in the query string, with the session token when there is one.
     ///
@@ -327,13 +419,14 @@ impl S3Storage {
             .map_err(|e| MoonclipError::Storage(format!("S3 key {key:?} is not a path: {e}")))?;
         let mut query = query.to_vec();
         query.sort_unstable();
+        let credentials = self.credentials()?;
         Ok(rusty_s3::signing::sign(
             &jiff::Timestamp::now(),
             method,
             url,
-            self.credentials.key(),
-            self.credentials.secret(),
-            self.credentials.token(),
+            credentials.key(),
+            credentials.secret(),
+            credentials.token(),
             self.bucket.region(),
             SIGNED_FOR_SECS,
             query.iter().copied(),
@@ -394,14 +487,15 @@ impl S3Storage {
             .object_url("")
             .map_err(|e| MoonclipError::Storage(format!("S3 bucket address: {e}")))?;
         let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
+        let credentials = self.credentials()?;
         let (query_string, headers) = header_signed(
             &url,
             query,
             &stamp,
             self.bucket.region(),
-            self.credentials.key(),
-            self.credentials.secret(),
-            self.credentials.token(),
+            credentials.key(),
+            credentials.secret(),
+            credentials.token(),
         );
         url.set_query(if query_string.is_empty() { None } else { Some(&query_string) });
         let mut request = self.agent.get(url.as_str());
@@ -418,7 +512,8 @@ impl S3Storage {
         body: Option<&[u8]>,
         query_params: &[(&str, &str)],
     ) -> std::result::Result<ureq::Response, MoonclipError> {
-        if method == "GET" && key.is_empty() && self.config.session_token.is_some() {
+        // A role's credentials are temporary: they always carry a token.
+        if method == "GET" && key.is_empty() && (self.config.session_token.is_some() || self.config.role.is_some()) {
             return self.listed(query_params);
         }
         let url = self.signed_url(method, key, query_params)?;
@@ -862,7 +957,7 @@ fn extract_xml_values(xml: &str, tag: &str) -> Vec<String> {
     results
 }
 
-fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
     extract_xml_values(xml, tag).into_iter().next()
 }
 
@@ -1056,6 +1151,7 @@ mod tests {
             path_style: false,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
+            role: None,
         };
 
         assert_eq!(
@@ -1077,6 +1173,7 @@ mod tests {
             path_style: false,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
+            role: None,
         };
         assert_eq!(config.normalized_prefix(), "foo/bar/");
 
@@ -1262,6 +1359,7 @@ mod tests {
             path_style,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
+            role: None,
         }
     }
 
@@ -1387,6 +1485,7 @@ mod tests {
             path_style: false,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
+            role: None,
         }
         .with_auto_path_style();
         assert!(!config.path_style);
@@ -1403,6 +1502,7 @@ mod tests {
             path_style: false,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
+            role: None,
         }
         .with_auto_path_style();
         assert!(config.path_style);
@@ -1419,6 +1519,7 @@ mod tests {
             path_style: true,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
+            role: None,
         }
         .with_auto_path_style();
         assert!(config.path_style);

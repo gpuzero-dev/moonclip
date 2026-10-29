@@ -107,12 +107,45 @@ mgr = CheckpointManager(
 )
 ```
 
-The keys come from the environment unless they are passed as `s3_access_key`
-and `s3_secret_key`: `MOONCLIP_S3_ACCESS_KEY`, `MOONCLIP_S3_SECRET_KEY` and,
-for temporary credentials, `MOONCLIP_S3_SESSION_TOKEN`; without them, the
-`AWS_*` names every S3 tool reads. Each pair is taken whole, never half from
-one set of names and half from the other. `restore_from_remote()` brings a
-store with an empty local directory back from the bucket.
+**Credentials**, in this order, the first that is there:
+
+1. `s3_access_key` and `s3_secret_key` (and `s3_session_token`) passed in.
+2. `MOONCLIP_S3_ACCESS_KEY`, `MOONCLIP_S3_SECRET_KEY` and, for temporary
+   credentials, `MOONCLIP_S3_SESSION_TOKEN`; then the `AWS_*` names every S3
+   tool reads. Each pair is taken whole, never half from one set of names and
+   half from the other.
+3. A profile in the shared credentials file: `AWS_PROFILE`, else `default`, in
+   `AWS_SHARED_CREDENTIALS_FILE`, else `~/.aws/credentials`. Its keys only: a
+   profile in `~/.aws/config` that assumes a role or uses SSO is not followed.
+4. The machine's role, with no key anywhere: a web identity
+   (`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, as EKS sets them), the
+   container's credentials (ECS, EKS Pod Identity), or the EC2 instance
+   profile through IMDSv2. These expire, and are fetched again before they
+   do, so a run longer than their life keeps writing.
+   `AWS_EC2_METADATA_DISABLED=true` skips the instance metadata service.
+
+Keep keys out of the command line, where `ps` and the shell's history keep
+them: the environment, a profile or a role. Objects are written without
+per-request encryption headers, so the bucket's default encryption (SSE-S3 or
+SSE-KMS) is what applies.
+
+**Requests.** A sync uploads each file the bucket does not have yet, one
+`PUT` each, and lists the prefix once. With Ravex's default of a delta at
+every step, a sync every 100 steps of a small model is in the order of 200
+`PUT`s: on AWS, about a tenth of a cent. `sync_every_n_saves` trades that
+against how much a lost machine costs. The syncs say nothing unless
+`MOONCLIP_LOG=debug`; failures are always printed.
+
+`restore_from_remote()` brings a store with an empty local directory back from
+the bucket.
+
+**Trust.** Restoring a checkpoint unpickles part of it: optimizer and
+scheduler state, and the metadata of each state dict. Anyone who can write to
+the directory or the bucket can therefore run code in the process that
+restores from it, as with `torch.load(..., weights_only=False)`. Give write
+access to a checkpoint bucket only to what you would let run code on your
+training machines, and do not restore checkpoints from a source you do not
+trust.
 
 `moonclip.Bucket` is the same client for plain files: whole objects by path
 (`get`, `put`, `list`), with no manifest and no tensors, for whatever has to
@@ -148,7 +181,7 @@ the code could see. A single process needs no configuration.
 | `MOONCLIP_PROFILE=1` | A per-phase breakdown of each save on stderr, and a line whenever a save waited for the previous one. |
 | `MOONCLIP_FSYNC=0` | Skips the `fsync` before a pack is renamed into place. Faster, but a power loss mid-save can leave a pack of the right length full of zeros that the manifest vouches for. |
 | `MOONCLIP_NO_PINNED_STAGING=1` | Copies GPU tensors through ordinary memory instead of pinned buffers, for a box where host RAM is the constraint. |
-| `MOONCLIP_LOG=debug` | Also logs the syncs a caller requests with `sync_prefix` when they succeed; errors are logged either way. |
+| `MOONCLIP_LOG=debug` | Also logs the syncs that went well, and the snapshots a restore left out because a sync had not carried them whole yet; errors are logged either way. |
 
 ## Moonclip and Ravex
 

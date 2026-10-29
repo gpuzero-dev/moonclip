@@ -59,6 +59,7 @@ fn backend_config(prefix: &str) -> Option<S3Config> {
         secret_key: std::env::var("MOONCLIP_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into()),
         // Set when the suite runs on temporary credentials, as R2's are.
         session_token: std::env::var("MOONCLIP_S3_SESSION_TOKEN").ok(),
+        role: None,
         path_style: true,
         timeout_secs: 30,
         // Overridable so one test can watch `put` choose the multipart path

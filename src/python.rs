@@ -8,7 +8,7 @@ use crate::coordinator::{Coordinator, CoordinatorConfig};
 use crate::manifest::{CompressionAlgo, LineageConfig, RetentionPolicy, TensorStorage};
 use crate::merger::MergerConfig;
 use crate::remote_sync::RemoteSyncConfig;
-use crate::s3::{S3Config, S3Credentials, S3Storage};
+use crate::s3::{S3Config, S3Storage};
 use crate::storage::{LocalStorage, StorageBackend};
 use crate::tensor::TensorData;
 
@@ -432,10 +432,13 @@ impl MoonclipManager {
         };
 
         let storage: Arc<dyn crate::storage::StorageBackend> = if let Some(bucket) = s3_bucket {
-            // Keys not given are read from the environment here, not by the
-            // caller (GPU-267): see `S3Credentials`.
-            let keys = S3Credentials::resolve(s3_access_key, s3_secret_key, s3_session_token)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            // Keys not given are found here, not by the caller (GPU-267): in
+            // the environment, a profile, or the machine's role (GPU-309).
+            // See `crate::s3::signing`.
+            let (access_key, secret_key, session_token, role) =
+                crate::s3::signing(s3_access_key, s3_secret_key, s3_session_token)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+                    .into_parts();
 
             let remote: Arc<dyn crate::storage::StorageBackend> = Arc::new(S3Storage::new(
                 S3Config {
@@ -443,9 +446,10 @@ impl MoonclipManager {
                     prefix: s3_prefix.into(),
                     region: s3_region.into(),
                     endpoint: s3_endpoint.map(|s| s.into()),
-                    access_key: keys.access_key,
-                    secret_key: keys.secret_key,
-                    session_token: keys.session_token,
+                    access_key,
+                    secret_key,
+                    session_token,
+                    role,
                     path_style: s3_path_style,
                     timeout_secs: 30,
                     single_put_limit: crate::s3::SINGLE_PUT_LIMIT,
@@ -717,8 +721,10 @@ impl Bucket {
         session_token: Option<&str>,
         timeout: u64,
     ) -> PyResult<Self> {
-        let keys = S3Credentials::resolve(access_key, secret_key, session_token)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let (access_key, secret_key, session_token, role) =
+            crate::s3::signing(access_key, secret_key, session_token)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+                .into_parts();
         let config = S3Config {
             bucket,
             prefix,
@@ -727,9 +733,10 @@ impl Bucket {
             // it, where they would refuse `auto`.
             region: region.unwrap_or_else(|| "us-east-1".into()),
             endpoint,
-            access_key: keys.access_key,
-            secret_key: keys.secret_key,
-            session_token: keys.session_token,
+            access_key,
+            secret_key,
+            session_token,
+            role,
             path_style: path_style.unwrap_or(false),
             timeout_secs: timeout,
             single_put_limit: crate::s3::SINGLE_PUT_LIMIT,

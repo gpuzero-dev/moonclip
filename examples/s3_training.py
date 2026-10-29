@@ -16,32 +16,28 @@ Usage with MinIO (local S3):
     mc alias set local http://localhost:9000 minioadmin minioadmin
     mc mb local/moonclip-test
 
-    # Train:
+    # Train. The keys go in the environment, never on the command line,
+    # where `ps` and the shell's history would keep them (GPU-309):
+    export MOONCLIP_S3_ACCESS_KEY=minioadmin
+    export MOONCLIP_S3_SECRET_KEY=minioadmin
     python examples/s3_training.py \
         --s3-endpoint http://localhost:9000 \
-        --s3-bucket moonclip-test \
-        --s3-access-key minioadmin \
-        --s3-secret-key minioadmin
+        --s3-bucket moonclip-test
 
-Usage with AWS S3:
+Usage with AWS S3, on a machine with a role (an instance profile, ECS, EKS)
+or a profile in ~/.aws/credentials - no keys to set:
     python examples/s3_training.py \
         --s3-bucket my-checkpoints \
-        --s3-region us-east-1 \
-        --s3-access-key AKIA... \
-        --s3-secret-key ...
+        --s3-region us-east-1
 
-Usage with Cloudflare R2:
+Usage with Cloudflare R2, with an R2 API token's keys in the environment:
     python examples/s3_training.py \
         --s3-endpoint https://<account_id>.r2.cloudflarestorage.com \
-        --s3-bucket my-checkpoints \
-        --s3-access-key ... \
-        --s3-secret-key ...
+        --s3-bucket my-checkpoints
 
-Usage with environment variables (recommended for CI/production):
+The bucket and endpoint can come from the environment too:
     export S3_ENDPOINT=http://localhost:9000
     export S3_BUCKET=moonclip-test
-    export S3_ACCESS_KEY=minioadmin
-    export S3_SECRET_KEY=minioadmin
     python examples/s3_training.py
 
 Requirements:
@@ -202,8 +198,8 @@ def train(args):
             "s3_bucket": args.s3_bucket,
             "s3_region": args.s3_region,
             "s3_prefix": args.s3_prefix,
-            "s3_access_key": args.s3_access_key,
-            "s3_secret_key": args.s3_secret_key,
+            # No keys here: Moonclip finds them in the environment, a
+            # profile or the machine's role (see the README's S3 section).
             "s3_path_style": args.s3_path_style,
             "sync_every_n_saves": args.sync_every,
         }
@@ -367,12 +363,6 @@ if __name__ == "__main__":
         "--s3-endpoint", type=str, default=os.environ.get("S3_ENDPOINT")
     )
     parser.add_argument(
-        "--s3-access-key", type=str, default=os.environ.get("S3_ACCESS_KEY")
-    )
-    parser.add_argument(
-        "--s3-secret-key", type=str, default=os.environ.get("S3_SECRET_KEY")
-    )
-    parser.add_argument(
         "--s3-path-style",
         action="store_true",
         default=os.environ.get("S3_PATH_STYLE", "").lower() in ("1", "true"),
@@ -383,10 +373,5 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
-    if args.s3_bucket and not args.s3_access_key:
-        parser.error("--s3-access-key (or S3_ACCESS_KEY env) required when using S3")
-    if args.s3_bucket and not args.s3_secret_key:
-        parser.error("--s3-secret-key (or S3_SECRET_KEY env) required when using S3")
 
     train(args)

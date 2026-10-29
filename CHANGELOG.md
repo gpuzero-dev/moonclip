@@ -2,7 +2,29 @@
 
 ## Unreleased
 
+### Added
+
+- **A bucket without keys: profiles and roles (GPU-309).** Without keys given
+  or in the environment, Moonclip now reads a profile from the shared
+  credentials file (`AWS_PROFILE`, `~/.aws/credentials`), and then the
+  machine's role: a web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` and
+  `AWS_ROLE_ARN`, as on EKS), the container's credentials (ECS, EKS Pod
+  Identity), or the EC2 instance profile through IMDSv2. A role's credentials
+  are fetched again five minutes before they expire, so a run longer than
+  their life keeps writing. Before, a machine with a role and no key could
+  not reach its bucket at all. A machine with neither fails as before, with
+  both reasons in the error; off EC2 the metadata service is given one
+  second, and `AWS_EC2_METADATA_DISABLED=true` skips it.
+- The README says how credentials are found, that the bucket's default
+  encryption is what applies, what a sync costs in requests, and the trust
+  model of a restore: part of a checkpoint is unpickled, so whoever can write
+  to the bucket can run code in the process that restores from it.
+
 ### Changed
+
+- `examples/s3_training.py` no longer takes `--s3-access-key` and
+  `--s3-secret-key`: keys on a command line end up in `ps` and the shell's
+  history. It reads them from the environment, a profile or a role.
 
 - **Syncs that went well say nothing (GPU-309).** Every periodic sync printed
   `[Moonclip sync] Copied 188 files...` to stderr, the most frequent line in a
