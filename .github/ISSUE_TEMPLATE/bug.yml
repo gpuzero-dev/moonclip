@@ -1,0 +1,21 @@
+name: Bug
+description: Something does not work as the documentation says.
+body:
+  - type: textarea
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead. Paste the output.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: How to reproduce
+      description: The smallest script or command that shows it.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Versions
+      description: "moonclip, Python, torch, OS (e.g. moonclip 0.10.1, Python 3.12, torch 2.9, Ubuntu 24.04)"
+    validations:
+      required: true

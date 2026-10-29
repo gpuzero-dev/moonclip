@@ -1,0 +1,12 @@
+name: Idea
+description: Something it should do and does not.
+body:
+  - type: textarea
+    attributes:
+      label: What you are trying to do
+      description: The problem, before the solution.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What you would like
