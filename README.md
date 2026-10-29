@@ -13,17 +13,35 @@ between checkpoints and should gain more; that has not been measured.
 The design follows [DECK (Meta, PVLDB 2025)](https://doi.org/10.14778/3750601.3750621).
 
 ```python
+import torch
 from moonclip import CheckpointManager
 
-mgr = CheckpointManager("./checkpoints", save_dtype="bf16")
-start_step = mgr.resume(model=model, optimizer=optimizer, scheduler=scheduler)
+torch.manual_seed(0)
+model = torch.nn.Sequential(torch.nn.Linear(16, 64), torch.nn.ReLU(), torch.nn.Linear(64, 1))
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1000)
 
-for step in range(start_step, 100_000):
-    loss = train_step(model, batch)
+mgr = CheckpointManager("./checkpoints")
+start_step = mgr.resume(model=model, optimizer=optimizer, scheduler=scheduler)
+print(f"starting at step {start_step}")
+
+for step in range(start_step, 5_000):
+    x = torch.randn(32, 16)
+    loss = torch.nn.functional.mse_loss(model(x), x.sum(dim=1, keepdim=True))
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
     if step % 500 == 0:
-        mgr.save(step=step, model=model, optimizer=optimizer,
-                 metadata={"loss": f"{loss:.4f}"})
+        mgr.save(step=step, model=model, optimizer=optimizer, scheduler=scheduler,
+                 metadata={"loss": f"{loss.item():.4f}"})
+        print(f"step {step}  loss {loss.item():.4f}")
+
+mgr.flush()
 ```
+
+It runs as it is, on a CPU, in a few seconds. Stop it with Ctrl-C part way
+and run it again: it starts after the last step it saved.
 
 `resume()` loads the latest checkpoint and returns the step after it, or 0
 when there is none. `save()` returns once the tensors are copied; hashing,

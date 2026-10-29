@@ -1,7 +1,8 @@
 """
 Example: Moonclip with PyTorch Distributed Data Parallel (DDP).
 
-Spawns 2 processes, trains a toy model, saves and loads checkpoints.
+Spawns 2 processes that share one store: trains a toy model a step, saves
+it as one snapshot with a shard per rank, trains on, and loads it back.
 
 Usage:
     python examples/ddp_integration.py
@@ -35,19 +36,24 @@ class ToyModel(nn.Module):
 
 
 def run_worker(rank, world_size, storage_root):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    # A port already chosen wins, so two runs side by side (CI) do not collide.
+    os.environ.setdefault("MASTER_PORT", "12355")
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
     model = ToyModel()
     ddp_model = DDP(model)
     optimizer = torch.optim.AdamW(ddp_model.parameters(), lr=1e-3)
 
-    # CheckpointManager auto-detects rank/world_size from torch.distributed
+    # The topology is stated, not detected: since 0.0.9 a manager under a
+    # multi-rank launcher refuses to guess whether the ranks share this store
+    # or each keep their own. Here they share it, as rank 0 and rank 1 of 2.
     manager = CheckpointManager(
         storage_root=storage_root,
         compression_level=3,
         max_full_snapshots=3,
+        world_size=world_size,
+        rank=rank,
     )
     print(f"[Rank {rank}] world_size={manager.world_size}, rank={manager.rank}")
 
@@ -80,7 +86,14 @@ def run_worker(rank, world_size, storage_root):
     print(f"[Rank {rank}] Mutated weights in step 2")
 
     # ─── Resume ──────────────────────────────────────────────────────
-    manager.load_latest(model=ddp_model, optimizer=optimizer)
+    # With a fresh manager, the way a restarted process resumes. The one that
+    # saved cannot be reused here on rank 1: rank 0 assembled the snapshot,
+    # and a manager reading does not re-read the manifest it already holds,
+    # so rank 1's copy predates its own shard being recorded.
+    restarted = CheckpointManager(
+        storage_root=storage_root, world_size=world_size, rank=rank
+    )
+    restarted.load_latest(model=ddp_model, optimizer=optimizer)
     print(f"[Rank {rank}] Resumed from checkpoint")
 
     # ─── Verify ──────────────────────────────────────────────────────

@@ -1060,11 +1060,13 @@ class CheckpointManager:
         total_raw = sum(s["total_raw"] for s in snaps)
         total_compressed = sum(s["total_compressed"] for s in snaps)
 
-        # Estimate naive cost: if every snapshot were a full save with no compression
-        # Use the raw size of the first full snapshot as the baseline per-snapshot cost
-        first_full = next((s for s in snaps if not s["is_delta"]), snaps[0])
-        naive_per_snapshot = first_full["total_raw"]
-        estimated_naive = naive_per_snapshot * len(snaps)
+        # What every save would have cost as a full, uncompressed write. Each
+        # snapshot's `total_raw` is already that - every tensor it was handed,
+        # skipped or not - so the sum is the answer, not an estimate. This used
+        # to be the first full snapshot's size times the count, which came out
+        # *below* the raw size whenever the first save was smaller than the
+        # later ones: before the optimizer had any state, say (GPU-295).
+        estimated_naive = total_raw
 
         saved = estimated_naive - total_compressed
         savings_pct = (saved / estimated_naive * 100) if estimated_naive > 0 else 0.0
@@ -1116,15 +1118,14 @@ class CheckpointManager:
         _emit(
             f"  Tensors:    {s['total_tensors_saved']}  ({s['full_tensors']} full, {s['delta_tensors']} delta, {s['skipped_tensors']} skipped)"
         )
-        _emit(f"  Raw size:   {_fmt(s['total_raw_bytes'])}")
         _emit(
-            f"  On disk:    {_fmt(s['total_compressed_bytes'])}  (compression: {s['compression_ratio']:.1%})"
+            f"  Raw size:   {_fmt(s['total_raw_bytes'])}  (every save full and uncompressed)"
         )
         _emit(
-            f"  Naive cost: {_fmt(s['estimated_naive_bytes'])}  (if every save were full, uncompressed)"
+            f"  On disk:    {_fmt(s['total_compressed_bytes'])}  ({s['compression_ratio']:.1%} of raw)"
         )
         _emit(
-            f"  Saved:      {_fmt(s['total_saved_bytes'])}  ({s['savings_percent']:.1f}% vs naive)"
+            f"  Saved:      {_fmt(s['total_saved_bytes'])}  ({s['savings_percent']:.1f}% of raw)"
         )
         _emit(f"{rule}\n")
 

@@ -288,6 +288,37 @@ class TestRawTensorGuards:
         )
 
 
+class TestTheStatsAddUp:
+    """`stats` compares what was written with what saving everything in
+    full would have cost (GPU-295). That cost used to be the first full
+    snapshot's size times the count, which put it below the raw size whenever
+    the first save was the smallest - here, before the optimizer had state -
+    and `print_stats` then showed a "naive cost" smaller than the raw size."""
+
+    def test_the_full_cost_is_the_raw_size_even_when_the_first_save_was_smaller(
+        self, tmp_path
+    ):
+        torch.manual_seed(0)
+        model = torch.nn.Linear(64, 64)
+        optimizer = torch.optim.AdamW(model.parameters())
+        mgr = CheckpointManager(storage_root=str(tmp_path), async_save=False)
+
+        # No optimizer state yet: the smallest save of the run.
+        mgr.save(step=0, model=model, optimizer=optimizer)
+        for step in range(1, 4):
+            model(torch.randn(4, 64)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            mgr.save(step=step, model=model, optimizer=optimizer)
+
+        stats = mgr.stats()
+        assert stats["estimated_naive_bytes"] == stats["total_raw_bytes"]
+        assert stats["total_saved_bytes"] == (
+            stats["total_raw_bytes"] - stats["total_compressed_bytes"]
+        )
+        assert 0 <= stats["savings_percent"] <= 100
+
+
 class TestReportingNeverKillsTheRun:
     """Reporting runs inside the training loop. A status line that raises takes
     the whole run down — and on a Windows console it did: `print_stats` drew a

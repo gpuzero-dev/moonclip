@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **The README's quickstart and `examples/ddp_integration.py` did not run
+  (GPU-295).** The quickstart trained a `model` with a `train_step` it never
+  defined, so copied as printed it raised `NameError`; it is now a script that
+  runs on a CPU in seconds and resumes when run again. The DDP example stopped
+  at the topology check 0.0.9 added (`the launcher says this is rank 1 of 2,
+  and CheckpointManager was not told which topology to use`); it now states
+  `world_size` and `rank`, honours a `MASTER_PORT` already set, and loads with
+  a fresh manager, as a restarted process would. The manager that saved cannot
+  load on a rank other than 0: its manifest predates rank 0 finalizing the
+  snapshot, and the read paths do not re-read it. `tests/test_examples.py`
+  now runs the quickstart and three of the examples.
+- **`stats()` put the cost of saving everything in full below the raw size
+  (GPU-295).** It took the first full snapshot's size times the number of
+  snapshots, which falls short whenever the first save is the smallest - before
+  the optimizer has any state, as in `transformer_implementation.py`, which
+  printed 13.8 MB raw against a "naive cost" of 8.5 MB. Each snapshot's raw
+  size already is that cost, so `estimated_naive_bytes` is now
+  `total_raw_bytes`, the savings are measured against it, and `print_stats()`
+  no longer prints the two as separate lines.
+- `examples/model_integration.py` described itself as a replacement for a
+  file of a project it was taken from; it now says what it shows.
+
 ## 0.3.1 — 2026-10-23
 
 ### Added

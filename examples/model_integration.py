@@ -1,8 +1,16 @@
 """
-Example: integrating Moonclip into Model's training loop.
+Example: Moonclip behind a training script's own save and load functions.
 
-Drop-in replacement for checkpoint.py with background async saves.
-Uses the public flatten_state_dict + save_raw API for zero-block saves.
+For a codebase that already has a `save_checkpoint(step, model, optimizer)`
+and a `load_checkpoint(...)` and wants to keep calling them: their bodies
+change, their callers do not. The state is flattened on the training thread
+with the public `flatten_state_dict`, and handed to `save_raw` on a thread of
+the script's own, so the loop waits only for the copy.
+
+    python examples/model_integration.py
+
+Writes into ./checkpoints and prints what was saved; run it from an empty
+directory.
 """
 
 import time
