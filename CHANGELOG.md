@@ -4,6 +4,14 @@
 
 ### Added
 
+- **`examples/compare_savers.py` (GPU-310)**, the benchmark behind the
+  README's new "Measured" table: how long a save holds the training loop and
+  what it writes, for `torch.save`, torch DCP and Moonclip, on the same model,
+  printed with the machine it ran on. The README's "1.6-3.0× faster and 1.9×
+  smaller" said neither the hardware nor the model, and is replaced by it.
+- The README says how Moonclip sits next to DCP, Lightning, Accelerate, the
+  Hugging Face Trainer and W&B, and what the version numbers promise about
+  the format on disk. `CONTRIBUTING.md`, `SECURITY.md` and issue templates.
 - **A bucket without keys: profiles and roles (GPU-309).** Without keys given
   or in the environment, Moonclip now reads a profile from the shared
   credentials file (`AWS_PROFILE`, `~/.aws/credentials`), and then the

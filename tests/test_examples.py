@@ -31,7 +31,7 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-def run(script, cwd):
+def run(script, cwd, *args):
     env = {
         **os.environ,
         # The Moonclip this session imports, whichever way it got onto the path.
@@ -40,7 +40,7 @@ def run(script, cwd):
         "MASTER_PORT": str(free_port()),
     }
     result = subprocess.run(
-        [sys.executable, str(script)], cwd=cwd, env=env, capture_output=True, text=True, timeout=600
+        [sys.executable, str(script), *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=600
     )
     assert result.returncode == 0, (result.stdout[-2000:], result.stderr[-2000:])
     return result.stdout
@@ -85,3 +85,11 @@ def test_transformer_implementation(tmp_path):
     # What the stats printed before GPU-295 got wrong: a "naive cost" of
     # saving everything in full that came out below the raw size.
     assert size("On disk") <= size("Raw size")
+
+
+def test_compare_savers(tmp_path):
+    """The benchmark the README's table comes from (GPU-310), on a model small
+    enough to take seconds: it has to run, and print a row per saver."""
+    out = run(EXAMPLES / "compare_savers.py", tmp_path, "--width", "64", "--layers", "1", "--steps", "4", "--every", "2")
+    for saver in ("| torch.save |", "| dcp |", "| moonclip |"):
+        assert saver in out, out

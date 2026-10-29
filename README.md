@@ -7,9 +7,11 @@ background, so a save holds the training loop only for the copy of the
 tensors.
 
 On dense pre-training, the least favourable case because Adam changes every
-parameter at every step, that measured 1.6-3.0× faster than `torch.save` and
-1.9× smaller. Fine-tuning, LoRA and adapters leave most tensors unchanged
-between checkpoints and should gain more; that has not been measured.
+parameter at every step, a save held the loop for 0.2 s where `torch.save`
+and torch's DCP took 1.1-2.7 s, and wrote a fifth less
+([measured](#measured), with the command that reproduces it). Fine-tuning,
+LoRA and adapters leave most tensors unchanged between checkpoints and should
+gain more; that has not been measured.
 The design follows [DECK (Meta, PVLDB 2025)](https://doi.org/10.14778/3750601.3750621).
 
 ```python
@@ -151,6 +153,42 @@ trust.
 (`get`, `put`, `list`), with no manifest and no tensors, for whatever has to
 sit next to the checkpoints.
 
+## Measured
+
+`python examples/compare_savers.py` trains the same model with each saver and
+prints this table. One run, 50M parameters with AdamW in fp32, a save every 5
+steps, 8 saves, on a 4-core x86_64 cloud VM with no GPU, torch 2.15:
+
+| saver | blocked per save (median) | flush at the end | written per save |
+|---|---|---|---|
+| `torch.save` | 2,694 ms | - | 576 MiB |
+| torch DCP (`dcp.save`) | 1,135 ms | - | 577 MiB |
+| Moonclip | 226 ms | 4,311 ms | 467 MiB |
+
+"Blocked" is what the training loop waits for: the whole save for the first
+two, the copy of the tensors for Moonclip, whose write runs in the background
+while training goes on. On this shared VM `torch.save` varied between 1.7 and
+3.6 s from run to run, and Moonclip between 0.2 and 0.5 s. Every parameter
+changes at every step here, so the deltas save only a fifth; `save_dtype`
+halves what is left, and on a GPU the copy that blocks is a device-to-host
+transfer. Run it on your own model and machine (`--width`, `--layers`,
+`--device cuda`) before trusting any of these numbers for yours.
+
+## Next to other tools
+
+- **torch DCP** saves a sharded model in parallel and reloads at another world
+  size; it writes the whole state every time and, unless asked for its async
+  mode, blocks while it does. Moonclip writes only what changed, in the
+  background, and keeps a history of checkpoints rather than one.
+- **Lightning, Accelerate, the Hugging Face Trainer** call `torch.save`,
+  safetensors or DCP from their own checkpoint hooks; Moonclip does not plug
+  into them. To use it with any of them, call `CheckpointManager.save()` where
+  you want a checkpoint, or put [Ravex](https://github.com/gpuzero-dev/ravex)
+  around the training function.
+- **W&B, MLflow** track metrics and keep artifacts. They live beside Moonclip:
+  the checkpoints stay in your directory or bucket, and the tracker records
+  what you log.
+
 ## More than one rank
 
 Say which topology the manager is for. Under `torchrun`, `"auto"` takes it
@@ -183,6 +221,24 @@ the code could see. A single process needs no configuration.
 | `MOONCLIP_NO_PINNED_STAGING=1` | Copies GPU tensors through ordinary memory instead of pinned buffers, for a box where host RAM is the constraint. |
 | `MOONCLIP_LOG=debug` | Also logs the syncs that went well, and the snapshots a restore left out because a sync had not carried them whole yet; errors are logged either way. |
 
+## Versioning and compatibility
+
+Moonclip is 0.x. Within it:
+
+- A **patch** release (0.3.x) never changes the format on disk and never
+  removes anything.
+- A **minor** release (0.x) may change the format. A newer Moonclip opens
+  every store an older one wrote, and moves it to the new layout at its next
+  save; an older Moonclip may refuse a store a newer one wrote, and says so.
+  The CHANGELOG marks every format change in bold, with its version.
+- What is removed is deprecated first, with a warning, for at least one minor
+  release.
+- Python 3.11 and later, each for as long as CPython supports it; a version
+  is dropped in a minor release. Rust: the `rust-version` in `Cargo.toml`.
+
+Pin a minor version (`moonclip~=0.3.1`) on machines that share a store, so
+that none of them writes a format another cannot read.
+
 ## Moonclip and Ravex
 
 Moonclip is the storage layer under [Ravex](https://github.com/gpuzero-dev/ravex),
@@ -192,6 +248,11 @@ bucket keys included. Ravex decides when to save and what, puts the result
 back into a live training process, and coordinates one or more machines; it
 carries no storage code of its own. To Moonclip a rank is only a number on a
 snapshot. Moonclip works on its own as well, as in the examples above.
+
+[GPU Zero](https://gpuzero.dev) is a hosted service built on both: it shows a
+run's metrics and checkpoints, resumes or forks it from any checkpoint, and
+starts GPUs in your own cloud account for it. Neither library needs it, and
+nothing is sent to it unless a run is configured to send it.
 
 ## Development
 
