@@ -4,6 +4,13 @@
 
 ### Added
 
+- **Wheels for Linux aarch64 and macOS on Apple silicon (GPU-311).** Until
+  now only Linux x86_64 had wheels, so on a GH200, Grace or Graviton node, or
+  on a Mac, `pip install moonclip` built from source and needed Rust, and
+  Ravex fell back to `torch_save`. The release builds aarch64 wheels on an ARM
+  runner in the manylinux_2_28 image, and macOS arm64 wheels (CPython
+  3.11-3.14, macOS 11 and later); every wheel is installed and imported by its
+  interpreter before it is uploaded.
 - **`examples/compare_savers.py` (GPU-310)**, the benchmark behind the
   README's new "Measured" table: how long a save holds the training loop and
   what it writes, for `torch.save`, torch DCP and Moonclip, on the same model,

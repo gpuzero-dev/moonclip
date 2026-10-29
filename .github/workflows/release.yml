@@ -251,21 +251,28 @@ jobs:
   # parallel, so an sdist that failed `twine check` still let six wheels reach
   # PyPI — a version burned with wheels and no source distribution, and
   # `--skip-existing` means a re-run cannot repair it.
+  #
+  # Linux on x86_64 and on aarch64 (GPU-311): GH200 and Grace nodes, Graviton.
+  # Until 0.3.1 only x86_64 had wheels, so on an ARM machine `pip` built from
+  # the sdist, which needs Rust, or Ravex fell back to `torch_save` - and the
+  # person trying it never saw what Moonclip does. Each architecture builds on
+  # a runner of its own kind, in the manylinux image for it: no emulation.
   wheels:
     needs: sdist
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     container:
       # The PyPA manylinux image ships every supported CPython under
       # /opt/python/cp3XX-cp3XX/bin/, each with pip — and, unlike plain bookworm,
       # produces wheels tagged manylinux_2_28 instead of linux_x86_64, which is
       # the difference between installable and not.
-      image: quay.io/pypa/manylinux_2_28_x86_64
+      image: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
     strategy:
       # One interpreter failing must not cancel the others. A missing wheel can
       # be added to an existing PyPI version afterwards; a cancelled matrix
       # leaves a half-published release with no way to finish it.
       fail-fast: false
       matrix:
+        arch: [x86_64, aarch64]
         # cp314t is 3.14's free-threaded build (GPU-189). PyO3 0.29 declares
         # the module safe without the GIL by default, so the same source
         # builds it; without this wheel a 3.14t user compiles from the sdist.
@@ -296,7 +303,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build the ${{ matrix.python }} wheel
+      - name: Build the ${{ matrix.python }} ${{ matrix.arch }} wheel
         run: |
           set -eu
           . "$HOME/.cargo/env"
@@ -318,9 +325,13 @@ jobs:
           # even if every job had built the same wheel.
           # Both tags, not a substring: `cp314` alone also matches a cp314t
           # wheel, so the GIL job could pass on the other job's output.
-          ls dist/ | grep -q -- "-${ABI%t}-${ABI}-" || {
-            echo "no ${{ matrix.python }} wheel in dist/" >&2; exit 1; }
+          ls dist/ | grep -q -- "-${ABI%t}-${ABI}-manylinux.*${{ matrix.arch }}" || {
+            echo "no ${{ matrix.python }} ${{ matrix.arch }} wheel in dist/" >&2; exit 1; }
           twine check dist/*.whl
+          # Installed and imported by the interpreter it was built for: a wheel
+          # that builds and does not load is the failure no tag check sees.
+          "$PY" -m pip install --quiet dist/*.whl
+          "$PY" -c "import moonclip; print('moonclip', moonclip.__version__, 'imports')"
 
       - name: Upload to PyPI
         if: ${{ github.event_name == 'push' }}
@@ -344,3 +355,66 @@ jobs:
           # is only the loud complaint, and idempotent re-runs are worth more
           # than that in a six-job matrix.
           /opt/python/cp312-cp312/bin/twine upload --skip-existing dist/*.whl
+
+  # macOS on Apple silicon (GPU-311): where most people try a library first.
+  # Without a wheel, `pip install moonclip` there needed Rust and Ravex fell
+  # back to `torch_save` without the person knowing what they were missing.
+  # arm64 only: Intel Macs are not where training runs, and the sdist still
+  # builds there. No free-threaded 3.14t yet: the runner's Python has none.
+  wheels-macos:
+    needs: sdist
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+    env:
+      # The oldest macOS the wheel says it runs on; every Apple-silicon Mac
+      # shipped with 11 or later.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Tag must match the package version
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          set -eu
+          VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          if [ "v$VERSION" != "$TAG" ]; then
+            echo "Tag $TAG does not match version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build the ${{ matrix.python }} macOS arm64 wheel
+        run: |
+          set -eu
+          # The runner has rustup. The toolchain rust-toolchain.toml names is
+          # installed here, with clippy, before maturin starts cargo several
+          # times at once: left to cargo, two of them race to add the same
+          # component (see rust-toolchain.toml).
+          rustup toolchain install 1.98.1 --profile minimal --component clippy
+          python -m pip install --quiet maturin twine
+          maturin build --release --locked --out dist --interpreter python
+          ls -la dist/
+          ls dist/ | grep -q -- "macosx_.*_arm64" || { echo "no macOS arm64 wheel in dist/" >&2; exit 1; }
+          twine check dist/*.whl
+          python -m pip install --quiet dist/*.whl
+          python -c "import moonclip; print('moonclip', moonclip.__version__, 'imports')"
+
+      - name: Upload to PyPI
+        if: ${{ github.event_name == 'push' }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
+        run: |
+          set -eu
+          python -m twine upload --skip-existing dist/*.whl
