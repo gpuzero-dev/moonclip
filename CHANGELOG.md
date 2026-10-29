@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- **Syncs that went well say nothing (GPU-309).** Every periodic sync printed
+  `[Moonclip sync] Copied 188 files...` to stderr, the most frequent line in a
+  job's log at Ravex's defaults, and a resume from a bucket printed "98
+  snapshot(s) in the manifest have no readable ranks.json ... left out" in the
+  ordinary case of a manifest synced ahead of its files. Both are printed only
+  with `MOONCLIP_LOG=debug` now; failures are printed as before.
+
 ### Fixed
 
 - **The README's quickstart and `examples/ddp_integration.py` did not run

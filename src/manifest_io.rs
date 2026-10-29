@@ -271,12 +271,19 @@ pub fn load(
         // base went.
         let before = snapshots.len();
         snapshots.retain(|s| s.base_snapshot_id.is_none_or(|base| !unreadable.contains(&base)));
-        eprintln!(
+        // At debug only (GPU-309). A store pulled from a bucket lists the
+        // snapshots the last sync carried the manifest of but not yet the
+        // files of, and a resume that leaves them out and goes on from what is
+        // whole is the ordinary case: said on every such resume, "98
+        // snapshot(s) ... have no readable ranks.json" read as damage.
+        if crate::remote_sync::verbose_logging() {
+            eprintln!(
             "[Moonclip] {} snapshot(s) in the manifest have no readable {RANKS_FILE}, \
              and {} delta(s) were taken against them; left out, resuming from what is whole.",
-            unreadable.len(),
-            before - snapshots.len()
-        );
+                unreadable.len(),
+                before - snapshots.len()
+            );
+        }
     }
 
     Ok(Some(Manifest {

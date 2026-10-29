@@ -116,11 +116,9 @@ const MANIFEST: &str = "manifest.json";
 enum SyncCommand {
     /// Sync all files under the given prefix to remote.
     SyncPrefix {
+        /// A sync that went well is logged only at debug, whoever asked
+        /// for it ([`verbose_logging`], GPU-309).
         prefix: String,
-        /// Whether a sync that went well stays out of the log. Set for the
-        /// caller's own files ([`RemoteSyncer::sync_prefix`]), clear for the
-        /// periodic checkpoint sync. See [`verbose_logging`].
-        quiet: bool,
     },
     /// Force sync everything, reporting the outcome back to the caller.
     SyncAll(mpsc::Sender<Option<String>>),
@@ -168,7 +166,7 @@ impl RemoteSyncer {
                 let mut life = crate::merger::ThreadLife::new(dead_worker);
                 for cmd in rx {
                     match cmd {
-                        SyncCommand::SyncPrefix { prefix, quiet } => {
+                        SyncCommand::SyncPrefix { prefix } => {
                             // Caught for the same reason the saver and the
                             // merger catch: a panic here killed this thread,
                             // the receiver dropped, and `notify_save` went on
@@ -183,11 +181,7 @@ impl RemoteSyncer {
                                 result
                             }));
                             match outcome {
-                                Ok(Ok(copied)) => {
-                                    if !quiet || verbose_logging() {
-                                        copied.log(&prefix);
-                                    }
-                                }
+                                Ok(Ok(copied)) => copied.log(&prefix),
                                 Ok(Err(e)) => {
                                     eprintln!("[Moonclip sync] Error syncing '{}': {}", prefix, e)
                                 }
@@ -263,16 +257,15 @@ impl RemoteSyncer {
         if count % self.sync_every == 0 {
             if let Some(ref tx) = self.sender {
                 let tx = tx.lock().unwrap();
-                // Sync snapshots and manifest. Not quiet: this is one line per
-                // checkpoint, which is rare and is the only sign in a job's
-                // log that the bucket has it.
+                // Sync snapshots and manifest. Logged at debug only, like
+                // every sync that went well (GPU-309): at a sync every hundred
+                // steps the line was a job log's most frequent, and Ravex
+                // says where the run's checkpoints are on its own.
                 let snapshots = tx.send(SyncCommand::SyncPrefix {
                     prefix: "snapshots".into(),
-                    quiet: false,
                 });
                 let manifest = tx.send(SyncCommand::SyncPrefix {
                     prefix: MANIFEST.into(),
-                    quiet: false,
                 });
                 // A failed send means the receiver is gone, which means the
                 // worker is. Recorded rather than discarded: this call is on
@@ -315,7 +308,6 @@ impl RemoteSyncer {
             .unwrap()
             .send(SyncCommand::SyncPrefix {
                 prefix: prefix.to_string(),
-                quiet: true,
             })
             .is_err()
         {
@@ -686,9 +678,16 @@ pub(crate) struct Copied {
 
 impl Copied {
     /// One line on stderr, if the walk moved anything or lost a file to a
-    /// concurrent delete. A walk that found everything already there is the
-    /// steady state and says nothing.
+    /// concurrent delete, and only with `MOONCLIP_LOG=debug` (GPU-309). A
+    /// walk that found everything already there is the steady state and says
+    /// nothing; one that copied is the steady state too - every periodic
+    /// sync copies the snapshots since the last - and printed "Copied 188
+    /// files" into the job's output every hundred steps, for nobody.
+    /// Failures are said either way, by the callers.
     pub(crate) fn log(&self, prefix: &str) {
+        if !verbose_logging() {
+            return;
+        }
         if self.synced > 0 || self.vanished > 0 {
             eprintln!(
                 "[Moonclip sync] Copied {} files, skipped {}, {} deleted since listed (prefix: '{}')",
@@ -698,12 +697,13 @@ impl Copied {
     }
 }
 
-/// Whether syncs that went well are logged even when they asked to be quiet.
+/// Whether syncs that went well, and other ordinary events, are logged.
 ///
-/// `MOONCLIP_LOG=debug` turns it on. Off by default, because the quiet syncs
-/// are the ones a caller makes for its own files, and Ravex makes one per
-/// metrics chunk (GPU-208). Read once, like `MOONCLIP_PROFILE`.
-fn verbose_logging() -> bool {
+/// `MOONCLIP_LOG=debug` turns it on. Off by default: Ravex syncs once per
+/// metrics chunk (GPU-208) and the checkpoints every `sync_every_n_saves`,
+/// and a line for each buried the job's own output (GPU-309). Failures are
+/// logged either way. Read once, like `MOONCLIP_PROFILE`.
+pub(crate) fn verbose_logging() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| is_debug_level(std::env::var("MOONCLIP_LOG").ok().as_deref()))
 }
