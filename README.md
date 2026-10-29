@@ -43,7 +43,7 @@ that is where training runs. On any other platform `pip` finds no wheel and
 the package has to be built, which needs a [Rust toolchain](https://rustup.rs/):
 
 ```bash
-pip install git+https://github.com/JHNMACHINE/moonclip.git
+pip install git+https://github.com/gpuzero-dev/moonclip.git
 ```
 
 `import moonclip` does not import torch: the Rust engine stores named tensors
@@ -131,7 +131,7 @@ the code could see. A single process needs no configuration.
 
 ## Moonclip and Ravex
 
-Moonclip is the storage layer under [Ravex](https://github.com/JHNMACHINE/ravex),
+Moonclip is the storage layer under [Ravex](https://github.com/gpuzero-dev/ravex),
 and the line between them is that saving files is Moonclip's and the run is
 Ravex's. Moonclip decides how a checkpoint becomes files and where they go,
 bucket keys included. Ravex decides when to save and what, puts the result
