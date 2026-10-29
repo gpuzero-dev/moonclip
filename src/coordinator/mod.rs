@@ -884,7 +884,33 @@ impl Core {
         Ok(())
     }
 
+    /// Re-read the manifest when it cannot answer for `snap_id` on this
+    /// rank: the snapshot is missing, unfinished, or has no entry for it
+    /// (GPU-316).
+    ///
+    /// In a multi-rank store rank 0 finalizes a snapshot, and the other
+    /// ranks hold the manifest they read before it did. The read paths do
+    /// not re-read on their own (see `heal_manifest`), so the manager that
+    /// had just saved could not load its own snapshot on any rank but 0:
+    /// "Rank 1 not found in snapshot". Asked only when the copy in memory
+    /// cannot answer, so a load it can answer costs nothing more, and a
+    /// single-rank store, whose one process wrote everything, never asks.
+    fn knows_or_reload(&self, snap_id: Uuid) -> Result<()> {
+        if self.config.world_size <= 1 {
+            return Ok(());
+        }
+        let known = self
+            .lock_manifest()
+            .find_snapshot(snap_id)
+            .is_some_and(|s| s.finalized && s.ranks.contains_key(&self.config.rank));
+        if !known {
+            self.reload_manifest()?;
+        }
+        Ok(())
+    }
+
     fn load(&self, snap_id: Uuid) -> Result<HashMap<String, Vec<u8>>> {
+        self.knows_or_reload(snap_id)?;
         // Fetched here, outside the pool: a rayon worker waiting on the
         // network holds a thread the load's own tensors need. The pin taken
         // for the fetch outlives it, and `load_in_pool` nests its own inside.
@@ -1088,6 +1114,12 @@ impl Core {
     }
 
     fn load_latest(&self) -> Result<(Uuid, HashMap<String, Vec<u8>>)> {
+        // Which snapshot is the newest is the question a stale copy answers
+        // wrong without an error: in a multi-rank store it is asked of the
+        // manifest as it is now (GPU-316).
+        if self.config.world_size > 1 {
+            self.reload_manifest()?;
+        }
         let manifest = self.lock_manifest();
         let snap = manifest
             .snapshots
@@ -1193,6 +1225,7 @@ impl Core {
     /// the returned map. Answering a typo with silence is how a caller ends up
     /// reasoning about a checkpoint it never read.
     fn load_tensors(&self, snap_id: Uuid, names: &[String]) -> Result<HashMap<String, Vec<u8>>> {
+        self.knows_or_reload(snap_id)?;
         let manifest = self.lock_manifest();
         let snap = manifest
             .find_snapshot(snap_id)

@@ -50,6 +50,16 @@
 
 ### Fixed
 
+- **The manager that saved could not load on a rank other than 0
+  (GPU-316).** In a store shared by several ranks, rank 0 finalizes each
+  snapshot, and the other ranks kept the manifest they had read before it
+  did; the read paths do not re-read it, so `save()` followed by
+  `load_latest()` on the same `CheckpointManager` failed on rank 1 with
+  "Rank 1 not found in snapshot". A load now re-reads the manifest when the
+  copy in memory does not know the snapshot finished for this rank, and a
+  multi-rank `load_latest` asks the manifest as it is now which snapshot is
+  newest. A load the copy can answer costs nothing more, and a single-rank
+  store is unchanged. `examples/ddp_integration.py` uses one manager again.
 - **The README's quickstart and `examples/ddp_integration.py` did not run
   (GPU-295).** The quickstart trained a `model` with a `train_step` it never
   defined, so copied as printed it raised `NameError`; it is now a script that

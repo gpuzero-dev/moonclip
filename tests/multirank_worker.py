@@ -90,6 +90,20 @@ def main():
             f"{name} did not come back"
         )
 
+    # 3b. The same manager that saved, without a restart: "save, carry on, go
+    #     back" in one process (GPU-316). On every rank but 0 its manifest
+    #     was the one from before rank 0 finalized, and the load failed with
+    #     "Rank 1 not found in snapshot".
+    with torch.no_grad():
+        for param in model.parameters():
+            param.zero_()
+    manager.load_latest(model=ddp_model, optimizer=optimizer)
+    dist.barrier()
+    for name, param in model.named_parameters():
+        assert torch.allclose(param, original[name], atol=1e-6), (
+            f"{name} did not come back through the manager that saved it"
+        )
+
     # 4. A second save from an almost unchanged model must be a delta, not a
     #    full copy - the whole point of the engine, and it has to hold in
     #    multi-rank mode too.

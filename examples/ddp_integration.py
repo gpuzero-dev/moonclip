@@ -86,14 +86,10 @@ def run_worker(rank, world_size, storage_root):
     print(f"[Rank {rank}] Mutated weights in step 2")
 
     # ─── Resume ──────────────────────────────────────────────────────
-    # With a fresh manager, the way a restarted process resumes. The one that
-    # saved cannot be reused here on rank 1: rank 0 assembled the snapshot,
-    # and a manager reading does not re-read the manifest it already holds,
-    # so rank 1's copy predates its own shard being recorded.
-    restarted = CheckpointManager(
-        storage_root=storage_root, world_size=world_size, rank=rank
-    )
-    restarted.load_latest(model=ddp_model, optimizer=optimizer)
+    # The same manager that saved: every rank reads the snapshot rank 0
+    # finalized. A restarted process would build a new manager the same way
+    # and call the same method.
+    manager.load_latest(model=ddp_model, optimizer=optimizer)
     print(f"[Rank {rank}] Resumed from checkpoint")
 
     # ─── Verify ──────────────────────────────────────────────────────
