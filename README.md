@@ -57,7 +57,10 @@ pip install moonclip
 ```
 
 Wheels exist for Linux x86_64 (manylinux_2_28), CPython 3.11-3.14, because
-that is where training runs. On any other platform `pip` finds no wheel and
+that is where training runs. On Python 3.10 or older `pip` may install 0.0.8
+or earlier instead of refusing, since those said they ran on 3.9: check
+`python --version`, or ask for `"moonclip>=0.3"`, which turns that into an
+error naming the Python version. On any other platform `pip` finds no wheel and
 the package has to be built, which needs a [Rust toolchain](https://rustup.rs/):
 
 ```bash
