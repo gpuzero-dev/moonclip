@@ -363,7 +363,11 @@ jobs:
   # builds there. No free-threaded 3.14t yet: the runner's Python has none.
   wheels-macos:
     needs: sdist
-    runs-on: macos-14
+    # macos-15, not 14: GitHub retires the macOS 14 image on 2026-11-02, and
+    # its scheduled brownouts already cancelled these jobs in the 0.3.2
+    # release. The wheel still says MACOSX_DEPLOYMENT_TARGET below, not the
+    # runner's version.
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
