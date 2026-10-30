@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 — 2026-10-30
 
 ### Added
 
@@ -67,9 +67,8 @@
   at the topology check 0.0.9 added (`the launcher says this is rank 1 of 2,
   and CheckpointManager was not told which topology to use`); it now states
   `world_size` and `rank`, honours a `MASTER_PORT` already set, and loads with
-  a fresh manager, as a restarted process would. The manager that saved cannot
-  load on a rank other than 0: its manifest predates rank 0 finalizing the
-  snapshot, and the read paths do not re-read it. `tests/test_examples.py`
+  a fresh manager, as a restarted process would (the same manager can, since
+  the fix above). `tests/test_examples.py`
   now runs the quickstart and three of the examples.
 - **`stats()` put the cost of saving everything in full below the raw size
   (GPU-295).** It took the first full snapshot's size times the number of
