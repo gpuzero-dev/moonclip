@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A role whose credentials come back already due is not asked again on
+  every request (GPU-360).** A metadata service that hands out keys inside
+  the five-minute refresh window, or past their expiry, has nothing fresher
+  a moment later; Moonclip asked it once per object written. It now signs
+  with what it got for ten seconds before asking again. Credentials fetched
+  long ago that become due are still fetched again at once.
+
 ## 0.3.2 — 2026-10-30
 
 ### Added

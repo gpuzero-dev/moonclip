@@ -34,7 +34,7 @@
 //! fails like a wrong key") is now this module's.
 
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{MoonclipError, Result};
 use crate::s3::S3Credentials;
@@ -43,6 +43,14 @@ use crate::s3::S3Credentials;
 /// signed just before the refresh is not refused mid-flight, short against
 /// the hour-plus that every one of these sources hands out.
 const REFRESH_BEFORE: Duration = Duration::from_secs(300);
+
+/// How long to sign with credentials that came back already due before
+/// asking again. A source that hands out keys inside the refresh window - or
+/// past their expiry, as a metadata mock did with keys from 2020 (GPU-360) -
+/// has nothing fresher a moment later, and asking on every request would be
+/// one call to it per object written. Keys fetched long ago that became due
+/// are not held back: they are asked for again at once.
+const AGAIN_AFTER: Duration = Duration::from_secs(10);
 
 /// How long a metadata service has to answer. One second, like the SDKs': it
 /// is a link-local address that answers in milliseconds where it exists.
@@ -68,7 +76,15 @@ pub enum Authorization {
 pub struct RoleCredentials {
     source: RoleSource,
     agent: ureq::Agent,
-    current: Mutex<Option<(S3Credentials, Option<SystemTime>)>>,
+    current: Mutex<Option<Held>>,
+    again_after: Duration,
+}
+
+/// The credentials last fetched: when they expire, and when they came.
+struct Held {
+    keys: S3Credentials,
+    expires: Option<SystemTime>,
+    fetched: Instant,
 }
 
 impl std::fmt::Debug for RoleCredentials {
@@ -84,7 +100,7 @@ impl RoleCredentials {
             .timeout_connect(METADATA_TIMEOUT)
             .timeout(Duration::from_secs(10))
             .build();
-        RoleCredentials { source, agent, current: Mutex::new(None) }
+        RoleCredentials { source, agent, current: Mutex::new(None), again_after: AGAIN_AFTER }
     }
 
     pub fn source(&self) -> &RoleSource {
@@ -92,20 +108,28 @@ impl RoleCredentials {
     }
 
     /// The credentials to sign with now, fetched when there are none yet or
-    /// they expire within [`REFRESH_BEFORE`].
+    /// they expire within [`REFRESH_BEFORE`] - but not again within
+    /// [`AGAIN_AFTER`] of the last fetch: due that soon, they came due.
     pub fn get(&self) -> Result<S3Credentials> {
         let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((keys, expires)) = current.as_ref() {
-            let due = expires.is_some_and(|at| {
+        if let Some(held) = current.as_ref() {
+            let due = held.expires.is_some_and(|at| {
                 at.duration_since(SystemTime::now()).map_or(true, |left| left < REFRESH_BEFORE)
             });
-            if !due {
-                return Ok(keys.clone());
+            if !due || held.fetched.elapsed() < self.again_after {
+                return Ok(held.keys.clone());
             }
         }
-        let fetched = self.fetch()?;
-        *current = Some(fetched.clone());
-        Ok(fetched.0)
+        let (keys, expires) = self.fetch()?;
+        *current = Some(Held { keys: keys.clone(), expires, fetched: Instant::now() });
+        Ok(keys)
+    }
+
+    /// The same, asking again after `again_after` rather than [`AGAIN_AFTER`].
+    #[cfg(test)]
+    fn asking_again_after(mut self, again_after: Duration) -> Self {
+        self.again_after = again_after;
+        self
     }
 
     fn fetch(&self) -> Result<(S3Credentials, Option<SystemTime>)> {
@@ -454,8 +478,28 @@ mod tests {
             let soon = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(60);
             (200, format!(r#"{{"AccessKeyId":"A","SecretAccessKey":"S","Token":"T","Expiration":"{soon}"}}"#))
         });
-        let role = RoleCredentials::new(RoleSource::Container { url: format!("{address}/creds"), authorization: None });
+        let role = RoleCredentials::new(RoleSource::Container { url: format!("{address}/creds"), authorization: None })
+            .asking_again_after(Duration::ZERO);
         role.get().unwrap();
+        role.get().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn credentials_that_come_back_expired_are_not_asked_for_on_every_request() {
+        // GPU-360: a metadata mock handed out keys from 2020. Asked again on
+        // every request, the source has nothing fresher; once per
+        // AGAIN_AFTER is enough.
+        let (address, seen) = serve(|_, _, _| {
+            (200, r#"{"AccessKeyId":"A","SecretAccessKey":"S","Token":"T","Expiration":"2020-01-01T00:00:00Z"}"#.into())
+        });
+        let role = RoleCredentials::new(RoleSource::Container { url: format!("{address}/creds"), authorization: None });
+        for _ in 0..20 {
+            assert_eq!(role.get().unwrap().access_key, "A");
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let role = role.asking_again_after(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(100));
         role.get().unwrap();
         assert_eq!(seen.lock().unwrap().len(), 2);
     }
