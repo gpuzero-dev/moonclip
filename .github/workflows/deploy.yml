@@ -80,4 +80,9 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ needs.tag.outputs.tag }}
-    secrets: inherit
+    # No secrets passed on: the release publishes with tokens it mints from
+    # GitHub's OIDC token (GPU-412), and a called job can be given no more
+    # than its caller holds, so the caller grants id-token here.
+    permissions:
+      contents: read
+      id-token: write

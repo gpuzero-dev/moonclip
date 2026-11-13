@@ -21,8 +21,10 @@ on:
         type: string
         required: true
 
-# The job token only reads: nothing here pushes, tags or comments, and releases
-# go out with their own PyPI and crates.io tokens.
+# The job token only reads: nothing here pushes, tags or comments. The jobs
+# that publish also ask for an OIDC token, which PyPI and crates.io trade for a
+# publish token that expires on its own (trusted publishing, GPU-412): no index
+# token is stored anywhere.
 permissions:
   contents: read
 
@@ -47,6 +49,13 @@ jobs:
   # uploaded, the version number is free on both indexes and the same tag can be
   # pushed again.
   crate:
+    # Publishes, so it runs in `production` (open to main, deploy and v* tags
+    # only) and may ask GitHub for an OIDC token, which the index trades for
+    # a short-lived publish token (GPU-412).
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     container:
       # Cargo already inside, so no rustup step. The verification build compiles
@@ -109,26 +118,22 @@ jobs:
             exit 1
           fi
 
-      # Both tokens, before either upload — including the one this job does not
-      # use. Finding out the PyPI secret is missing after crates.io has accepted
-      # the crate leaves the release half done, and neither index lets a version
-      # number be retried.
-      - name: Both publish tokens must be present
-        env:
-          PYPI_TOKEN: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
-          CARGO_TOKEN: ${{ secrets.MOONCLIP_CARGO_TOKEN }}
+      # Both indexes, before either upload - including PyPI, which this job does
+      # not upload to. Finding out PyPI does not trust this workflow after
+      # crates.io has accepted the crate leaves the release half done, and
+      # neither index lets a version number be retried. Runs on a rehearsal
+      # too: it is how a manual run proves trusted publishing still works.
+      - name: Both indexes must trust this workflow
         run: |
           set -eu
-          missing=""
-          [ -n "${PYPI_TOKEN:-}" ] || missing="$missing MOONCLIP_PYPI_TOKEN"
-          [ -n "${CARGO_TOKEN:-}" ] || missing="$missing MOONCLIP_CARGO_TOKEN"
-          if [ -n "$missing" ]; then
-            echo "Missing secret(s):$missing" >&2
-            echo "A tag was pushed but this release would only go out halfway." >&2
-            echo "Add them on the repository, delete the tag and push it again." >&2
-            exit 1
-          fi
-          echo "both tokens present"
+          PYPI=$(sh .github/scripts/trusted-token.sh pypi)
+          echo "::add-mask::$PYPI"
+          CARGO=$(sh .github/scripts/trusted-token.sh crates.io)
+          echo "::add-mask::$CARGO"
+          # Not used here: revoked at once rather than left to expire. PyPI's
+          # has no revocation and lapses in fifteen minutes.
+          curl -sSf -X DELETE -H "Authorization: Bearer $CARGO"             https://crates.io/api/v1/trusted_publishing/tokens
+          echo "PyPI and crates.io both issue a token to this workflow"
 
       # The crates.io half of `twine upload --skip-existing`, and it exists for
       # the same reason: this job gates every other one, so it has to survive
@@ -149,9 +154,6 @@ jobs:
       # either, so the upload could not have succeeded regardless — only the
       # complaint is lost.
       - name: Publish to crates.io
-        env:
-          # Left name: what cargo itself reads. Right name: the repository secret.
-          CARGO_REGISTRY_TOKEN: ${{ secrets.MOONCLIP_CARGO_TOKEN }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
@@ -170,6 +172,12 @@ jobs:
             exit 0
           fi
 
+          # Minted here, after the skip, and revoked when the step ends however
+          # it ends: a token is held only for the one upload.
+          CARGO_REGISTRY_TOKEN=$(sh .github/scripts/trusted-token.sh crates.io)
+          echo "::add-mask::$CARGO_REGISTRY_TOKEN"
+          export CARGO_REGISTRY_TOKEN
+          trap 'curl -sS -X DELETE -H "Authorization: Bearer $CARGO_REGISTRY_TOKEN" https://crates.io/api/v1/trusted_publishing/tokens' EXIT
           cargo publish --locked
 
   # The source distribution, once — not per interpreter.
@@ -185,6 +193,13 @@ jobs:
   # Ordered before the wheels for the same reason the crate is: if the release
   # stops here, no wheel has gone out and the version number is still free.
   sdist:
+    # Publishes, so it runs in `production` (open to main, deploy and v* tags
+    # only) and may ask GitHub for an OIDC token, which the index trades for
+    # a short-lived publish token (GPU-412).
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
     needs: crate
     runs-on: ubuntu-latest
     container:
@@ -238,9 +253,13 @@ jobs:
         if: ${{ github.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
         run: |
           set -eu
+          # Trusted publishing (GPU-412): a token minted for this job, not a
+          # stored secret. Masked before anything could print it.
+          TWINE_PASSWORD=$(sh .github/scripts/trusted-token.sh pypi)
+          echo "::add-mask::$TWINE_PASSWORD"
+          export TWINE_PASSWORD
           /opt/python/cp312-cp312/bin/twine upload --skip-existing dist/*.tar.gz
 
   # One wheel per interpreter, one job each. Native wheels rather than a single
@@ -258,6 +277,13 @@ jobs:
   # person trying it never saw what Moonclip does. Each architecture builds on
   # a runner of its own kind, in the manylinux image for it: no emulation.
   wheels:
+    # Publishes, so it runs in `production` (open to main, deploy and v* tags
+    # only) and may ask GitHub for an OIDC token, which the index trades for
+    # a short-lived publish token (GPU-412).
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
     needs: sdist
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     container:
@@ -337,9 +363,13 @@ jobs:
         if: ${{ github.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
         run: |
           set -eu
+          # Trusted publishing (GPU-412): a token minted for this job, not a
+          # stored secret. Masked before anything could print it.
+          TWINE_PASSWORD=$(sh .github/scripts/trusted-token.sh pypi)
+          echo "::add-mask::$TWINE_PASSWORD"
+          export TWINE_PASSWORD
           # One file per job. PyPI accepts files added to an existing version, so
           # six jobs filling in one release is a supported flow — and if one
           # fails, its wheel can be added later without spending a new version.
@@ -362,6 +392,13 @@ jobs:
   # arm64 only: Intel Macs are not where training runs, and the sdist still
   # builds there. No free-threaded 3.14t yet: the runner's Python has none.
   wheels-macos:
+    # Publishes, so it runs in `production` (open to main, deploy and v* tags
+    # only) and may ask GitHub for an OIDC token, which the index trades for
+    # a short-lived publish token (GPU-412).
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
     needs: sdist
     # macos-15, not 14: GitHub retires the macOS 14 image on 2026-11-02, and
     # its scheduled brownouts already cancelled these jobs in the 0.3.2
@@ -418,7 +455,11 @@ jobs:
         if: ${{ github.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
         run: |
           set -eu
+          # Trusted publishing (GPU-412): a token minted for this job, not a
+          # stored secret. Masked before anything could print it.
+          TWINE_PASSWORD=$(sh .github/scripts/trusted-token.sh pypi)
+          echo "::add-mask::$TWINE_PASSWORD"
+          export TWINE_PASSWORD
           python -m twine upload --skip-existing dist/*.whl
