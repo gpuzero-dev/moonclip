@@ -132,7 +132,7 @@ jobs:
           echo "::add-mask::$CARGO"
           # Not used here: revoked at once rather than left to expire. PyPI's
           # has no revocation and lapses in fifteen minutes.
-          curl -sSf -X DELETE -H "Authorization: Bearer $CARGO"             https://crates.io/api/v1/trusted_publishing/tokens
+          curl -sSf -A "gpuzero-dev release" -X DELETE -H "Authorization: Bearer $CARGO" https://crates.io/api/v1/trusted_publishing/tokens
           echo "PyPI and crates.io both issue a token to this workflow"
 
       # The crates.io half of `twine upload --skip-existing`, and it exists for
@@ -177,7 +177,7 @@ jobs:
           CARGO_REGISTRY_TOKEN=$(sh .github/scripts/trusted-token.sh crates.io)
           echo "::add-mask::$CARGO_REGISTRY_TOKEN"
           export CARGO_REGISTRY_TOKEN
-          trap 'curl -sS -X DELETE -H "Authorization: Bearer $CARGO_REGISTRY_TOKEN" https://crates.io/api/v1/trusted_publishing/tokens' EXIT
+          trap 'curl -sS -A "gpuzero-dev release" -X DELETE -H "Authorization: Bearer $CARGO_REGISTRY_TOKEN" https://crates.io/api/v1/trusted_publishing/tokens' EXIT
           cargo publish --locked
 
   # The source distribution, once — not per interpreter.

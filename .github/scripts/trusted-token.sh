@@ -36,7 +36,8 @@ fi
 
 # The audience is the index's own name: PyPI expects "pypi", crates.io its
 # host.
-jwt=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+agent="gpuzero-dev release (trusted-token.sh)"
+jwt=$(curl -sSf -A "$agent" -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
   "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$index" \
   | sed -n 's/.*"value" *: *"\([^"]*\)".*/\1/p')
 if [ -z "$jwt" ]; then
@@ -44,13 +45,18 @@ if [ -z "$jwt" ]; then
   exit 1
 fi
 
-body=$(curl -sS -X POST "$url" -H 'Content-Type: application/json' \
-  -d "{\"$key\":\"$jwt\"}")
+# A User-Agent of our own: crates.io refuses a request without one with a 403
+# and an empty body, which read like a publisher it did not trust. The status
+# is printed for the same reason: an empty refusal must still say what it was.
+body=$(curl -sS -A "$agent" -w '\n%{http_code}' -X POST "$url" \
+  -H 'Content-Type: application/json' -d "{\"$key\":\"$jwt\"}")
+status=$(printf '%s\n' "$body" | tail -n 1)
+body=$(printf '%s\n' "$body" | sed '$d')
 token=$(printf '%s' "$body" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p')
 if [ -z "$token" ]; then
   # The refusal names what did not match (workflow, environment, repository);
   # it carries no secret, so it is printed whole.
-  echo "$index did not issue a token. Its answer:" >&2
+  echo "$index did not issue a token (HTTP $status). Its answer:" >&2
   printf '%s\n' "$body" >&2
   echo "Check this repository's trusted publisher on $index: workflow file" >&2
   echo "and environment must be the ones this job runs in." >&2
