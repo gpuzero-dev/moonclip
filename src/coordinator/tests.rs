@@ -242,6 +242,57 @@ fn special_characters_in_tensor_names() {
     assert_eq!(loaded["model/encoder/block_0/layer_0"], tensors[1].data);
 }
 
+/// GPU-418: a store opened again under another retention is kept by the new
+/// one. It kept the numbers of the run that made it, so a run moved from a
+/// delta at every step to a full every checkpoint went on writing deltas and
+/// keeping the old window.
+#[test]
+fn a_store_opened_again_follows_the_new_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |retention: RetentionPolicy| {
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        Coordinator::new(storage, CoordinatorConfig {
+            world_size: 1,
+            rank: 0,
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention,
+            delta_max_ratio: 0.95,
+            ..Default::default()
+        }).unwrap()
+    };
+    let save = |coord: &Coordinator, step: u64| {
+        let mut data = vec![0u8; 8192];
+        data[0] = step as u8;
+        coord.save(step, vec![TensorData {
+            name: "w".into(), shape: vec![8192], dtype: "uint8".into(), data,
+        }], HashMap::new()).unwrap();
+    };
+
+    let window = open(RetentionPolicy {
+        max_full_snapshots: 6,
+        max_deltas_per_full: 100,
+        full_snapshot_every_steps: 100,
+        max_total_snapshots: Some(6),
+    });
+    for step in 1..=3 {
+        save(&window, step);
+    }
+    assert_eq!(window.list_snapshots().iter().filter(|s| s.is_delta).count(), 2);
+    drop(window);
+
+    let fulls = open(RetentionPolicy {
+        max_full_snapshots: 2,
+        max_deltas_per_full: 100,
+        full_snapshot_every_steps: 1,
+        max_total_snapshots: Some(2),
+    });
+    for step in [5, 10] {
+        save(&fulls, step);
+    }
+    let kept: Vec<(u64, bool)> = fulls.list_snapshots().iter().map(|s| (s.step, s.is_delta)).collect();
+    assert_eq!(kept, vec![(5, false), (10, false)]);
+}
+
 #[test]
 fn force_full_after_n_steps() {
     let dir = tempfile::tempdir().unwrap();

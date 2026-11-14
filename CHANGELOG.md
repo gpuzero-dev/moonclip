@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **A store opened again is kept by the retention it is opened with
+  (GPU-418).** The manifest records the retention it was written under, and an
+  existing store kept that one whatever the manager opening it was given: a
+  run resumed with another `max_total_snapshots` or `full_every_steps` went on
+  by the numbers of the run that made the store, and said nothing. Now the
+  manager's own settings govern the store it opens, at construction and at
+  every re-read of the manifest.
 - **A role whose credentials come back already due is not asked again on
   every request (GPU-360).** A metadata service that hands out keys inside
   the five-minute refresh window, or past their expiry, has nothing fresher

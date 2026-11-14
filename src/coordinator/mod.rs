@@ -1929,7 +1929,10 @@ impl Core {
         )?;
         // With nothing on storage to re-read, the copy in memory is all there
         // is and distrusting it further buys nothing.
-        if let Some(read) = read {
+        if let Some(mut read) = read {
+            // The opener's policy, as at construction (`load_manifest`): the
+            // re-read brings back whatever retention was last written.
+            read.retention = self.config.retention.clone();
             *m = read;
         }
         self.manifest_stale.store(false, Ordering::Relaxed);

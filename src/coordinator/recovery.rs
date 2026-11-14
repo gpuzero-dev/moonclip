@@ -230,9 +230,21 @@ pub(super) fn recover_or_reclaim_orphans(storage: &dyn StorageBackend, manifest:
     recovered > 0
 }
 
+/// The store's manifest, or a new one, governed by `config`'s retention.
+///
+/// **The retention is the opener's, not the store's.** The manifest records
+/// the policy it was written under, and an existing store used to keep that
+/// one whatever the manager opening it was given: a run resumed with another
+/// `keep_last`, or moved from a delta at every step to a full every
+/// checkpoint mid-run (GPU-418), went on keeping and cutting snapshots by the
+/// numbers of the first run that made the store, and said nothing. The policy
+/// is how this process wants its saves kept, so this process says it.
 pub(super) fn load_manifest(storage: &dyn StorageBackend, config: &CoordinatorConfig) -> Result<Manifest> {
     match crate::manifest_io::load(storage, None)? {
-        Some(manifest) => Ok(manifest),
+        Some(mut manifest) => {
+            manifest.retention = config.retention.clone();
+            Ok(manifest)
+        }
         None => Ok(Manifest {
             world_size: config.world_size,
             retention: config.retention.clone(),
