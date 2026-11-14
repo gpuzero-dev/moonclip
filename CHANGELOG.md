@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A remote slower than the saves always holds a checkpoint a resume can
+  load (GPU-422).** The periodic sync copied the snapshots it had listed, then
+  sent the deletes the window had queued meanwhile, then the manifest of that
+  moment. With a delta at every step and a bucket slower than the saves -
+  19 MB a step at fourteen a second, to R2 - the deletes took off the remote
+  everything just copied and the manifest named a window never copied:
+  seventeen minutes of training left no checkpoint in the bucket, and the
+  resume started from nothing. Now a periodic sync reads the manifest once,
+  copies its newest snapshot and the full it stands on first and alone, puts
+  up that manifest kept to the snapshots the remote holds, then copies what
+  else of the window is still there and puts it up again. Measured through a
+  link of 3 MB/s, a run killed at step 1030 resumed from step 671 on a machine
+  with an empty disk; 0.3.3 left it nothing, as on the node. Deletes go only for what that manifest does not
+  name, and never alongside an upload of a metrics file. A sync with nothing
+  whole to show leaves the remote on its last point.
+
 ## 0.3.3 — 2026-11-14
 
 ### Fixed

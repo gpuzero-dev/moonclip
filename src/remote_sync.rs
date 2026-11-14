@@ -1,11 +1,15 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+use uuid::Uuid;
+
 use crate::error::{Result, MoonclipError};
+use crate::manifest::Snapshot;
+use crate::manifest_io;
 use crate::storage::StorageBackend;
 
 /// Keys that have been deleted locally and are still on the remote.
@@ -66,6 +70,15 @@ impl PendingDeletes {
     fn drain(&self) -> Vec<String> {
         std::mem::take(&mut *self.keys.lock().unwrap())
     }
+
+    /// Put back keys taken by [`PendingDeletes::drain`] that must wait: the
+    /// manifest last uploaded still names them (GPU-422).
+    fn restore(&self, keys: Vec<String>) {
+        if keys.is_empty() {
+            return;
+        }
+        self.keys.lock().unwrap().extend(keys);
+    }
 }
 
 /// Configuration for batched remote sync.
@@ -114,6 +127,9 @@ pub(crate) const IN_FLIGHT_BYTES: u64 = 1 << 30;
 const MANIFEST: &str = "manifest.json";
 
 enum SyncCommand {
+    /// The periodic sync: a point the remote can resume from (GPU-422). See
+    /// [`sync_checkpoint`].
+    Checkpoint,
     /// Sync all files under the given prefix to remote.
     SyncPrefix {
         /// A sync that went well is logged only at debug, whoever asked
@@ -175,10 +191,14 @@ impl RemoteSyncer {
                             // believes it has remote backups and does not, and
                             // finds out when the machine dies and a resume is
                             // attempted.
+                            //
+                            // No deletes here (GPU-422): a prefix is a file a
+                            // caller wrote beside the checkpoints - Ravex's
+                            // metrics every 15 s - and deleting from the
+                            // remote is only safe next to the upload of a
+                            // manifest, which says what must stay.
                             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                                let result = sync_prefix(&local, &remote, &prefix);
-                                apply_deletes(&remote, &deletes);
-                                result
+                                sync_prefix(&local, &remote, &prefix)
                             }));
                             match outcome {
                                 Ok(Ok(copied)) => copied.log(&prefix),
@@ -188,6 +208,21 @@ impl RemoteSyncer {
                                 Err(panic) => eprintln!(
                                     "[Moonclip sync] Syncing '{}' panicked: {}",
                                     prefix,
+                                    crate::error::panic_message(&*panic)
+                                ),
+                            }
+                        }
+                        SyncCommand::Checkpoint => {
+                            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                                sync_checkpoint(&local, &remote, &deletes)
+                            }));
+                            match outcome {
+                                Ok(Ok(copied)) => copied.log("snapshots"),
+                                Ok(Err(e)) => {
+                                    eprintln!("[Moonclip sync] Error syncing a checkpoint: {}", e)
+                                }
+                                Err(panic) => eprintln!(
+                                    "[Moonclip sync] Syncing a checkpoint panicked: {}",
                                     crate::error::panic_message(&*panic)
                                 ),
                             }
@@ -257,21 +292,17 @@ impl RemoteSyncer {
         if count % self.sync_every == 0 {
             if let Some(ref tx) = self.sender {
                 let tx = tx.lock().unwrap();
-                // Sync snapshots and manifest. Logged at debug only, like
-                // every sync that went well (GPU-309): at a sync every hundred
-                // steps the line was a job log's most frequent, and Ravex
-                // says where the run's checkpoints are on its own.
-                let snapshots = tx.send(SyncCommand::SyncPrefix {
-                    prefix: "snapshots".into(),
-                });
-                let manifest = tx.send(SyncCommand::SyncPrefix {
-                    prefix: MANIFEST.into(),
-                });
+                // A point the remote can resume from, and its manifest
+                // (GPU-422). Logged at debug only, like every sync that went
+                // well (GPU-309): at a sync every hundred steps the line was a
+                // job log's most frequent, and Ravex says where the run's
+                // checkpoints are on its own.
+                let sent = tx.send(SyncCommand::Checkpoint);
                 // A failed send means the receiver is gone, which means the
                 // worker is. Recorded rather than discarded: this call is on
                 // the save path and cannot fail loudly, but a syncer that is
                 // no longer there has to be visible to the next `flush`.
-                if snapshots.is_err() || manifest.is_err() {
+                if sent.is_err() {
                     self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -385,7 +416,11 @@ impl Drop for RemoteSyncer {
 /// sync that failed to tidy up is a bill. Reporting them the same way would
 /// teach callers to ignore both.
 fn apply_deletes(remote: &Arc<dyn StorageBackend>, deletes: &Arc<PendingDeletes>) {
-    let keys = deletes.drain();
+    delete_all(remote, deletes.drain());
+}
+
+/// Delete `keys` from the remote, several at once.
+fn delete_all(remote: &Arc<dyn StorageBackend>, keys: Vec<String>) {
     if keys.is_empty() {
         return;
     }
@@ -422,6 +457,158 @@ fn apply_deletes(remote: &Arc<dyn StorageBackend>, deletes: &Arc<PendingDeletes>
     }
 }
 
+/// The data files of `snapshot`: its packs, and any tensor kept in a file of
+/// its own. Not the file of its ranks, which [`manifest_io::persist`] writes
+/// with the manifest.
+fn data_files(snapshot: &Snapshot) -> Vec<String> {
+    let mut files = Vec::new();
+    for entry in snapshot.ranks.values() {
+        files.extend(entry.pack_file.iter().cloned());
+        files.extend(entry.tensors.iter().filter_map(|t| t.filename.clone()));
+    }
+    files
+}
+
+/// The periodic sync: put on the remote a point a resume can start from, and
+/// a manifest that names nothing else (GPU-422).
+///
+/// It was two walks, the snapshots then the manifest, each of the store as it
+/// was when the walk began. With a delta at every step they fell apart once
+/// the remote was slower than the saves: on 2026-11-14 a node wrote 19 MB a
+/// step at fourteen steps a second, about 270 MB/s, to R2 that takes a few
+/// tens. A walk copied what it had listed, by then a thousand steps old; the
+/// deletes the window had queued meanwhile then took all of it off the
+/// remote; and the manifest went up naming the window of that moment, which
+/// had never been copied. Seventeen minutes of training left a bucket with no
+/// checkpoint in it, and the resume started from nothing.
+///
+/// So the local manifest is read once, and its newest finalised snapshot and
+/// the full it stands on go up first, alone: the point a resume needs, and
+/// the manifest right after it. The rest of the window follows, newest
+/// first, as far as it is still there - a file the window deleted while this
+/// ran is skipped, as before - and the manifest again. Each time the manifest
+/// put on the remote is that one, **kept to the snapshots the remote holds**,
+/// and a delta whose base it does not hold goes with its base. The deletes the
+/// window queued are sent only for what that manifest does not name; the rest
+/// wait for a later sync. So the remote moves from one whole point to the
+/// next, never through a manifest naming what it lacks: a run that saves
+/// faster than its bucket takes keeps fewer steps there, not none.
+///
+/// A sync with nothing whole to show - no finalised snapshot, or none whose
+/// files all made it - leaves the remote's manifest as it was.
+fn sync_checkpoint(
+    local: &Arc<dyn StorageBackend>,
+    remote: &Arc<dyn StorageBackend>,
+    deletes: &Arc<PendingDeletes>,
+) -> Result<Copied> {
+    let Some(manifest) = manifest_io::load(local.as_ref(), None)? else {
+        return Ok(Copied::default());
+    };
+    let finalized: Vec<&Snapshot> = manifest.snapshots.iter().filter(|s| s.finalized).collect();
+    let by_id: HashMap<Uuid, &Snapshot> = finalized.iter().map(|s| (s.id, *s)).collect();
+
+    // The resume point - the newest and the full it stands on - then the rest
+    // of the window, newest first.
+    let mut point: Vec<Uuid> = Vec::new();
+    if let Some(newest) = finalized.last() {
+        point.push(newest.id);
+        if let Some(base) = newest.base_snapshot_id {
+            point.push(base);
+        }
+    }
+    let rest: Vec<Uuid> = finalized
+        .iter()
+        .rev()
+        .map(|s| s.id)
+        .filter(|id| !point.contains(id))
+        .collect();
+
+    let sizes: HashMap<String, u64> = local
+        .list_sized("snapshots")?
+        .into_iter()
+        .filter_map(|(file, size)| size.map(|size| (file, size)))
+        .collect();
+    let mut there: HashSet<String> = remote.list("snapshots")?.into_iter().collect();
+    let mut copied = Copied::default();
+
+    // In two goes, each followed by the manifest of what the remote then
+    // holds. The point alone first: copied together with the window, the
+    // transfers shared the link and the manifest waited for all of it - on a
+    // link of a few MB/s, minutes in which the remote had nothing to resume
+    // from.
+    for (round, ids) in [&point, &rest].into_iter().enumerate() {
+        let mut wanted: Vec<(String, Option<u64>)> = Vec::new();
+        for id in ids {
+            let Some(snapshot) = by_id.get(id) else {
+                continue;
+            };
+            for file in data_files(snapshot) {
+                if there.contains(&file) {
+                    copied.skipped += 1;
+                } else if !wanted.iter().any(|(listed, _)| *listed == file) {
+                    let size = sizes.get(&file).copied();
+                    wanted.push((file, size));
+                }
+            }
+        }
+        // The point's manifest goes up even with nothing to copy: the newest
+        // may already be there from the last sync. The window's only when it
+        // brought something.
+        if round > 0 && wanted.is_empty() {
+            continue;
+        }
+        let (synced, vanished) = copy_files(local, remote, &wanted, TRANSFERS, IN_FLIGHT_BYTES)?;
+        copied.synced += synced;
+        copied.vanished += vanished;
+        // What the remote holds now, asked of the remote: a copy that did not
+        // make it is one the manifest must not name.
+        there = remote.list("snapshots")?.into_iter().collect();
+        put_up(&manifest, &there, remote, deletes)?;
+    }
+    Ok(copied)
+}
+
+/// Put on the remote `manifest` kept to the snapshots whose data `there`
+/// holds - a delta whose base is not kept goes too - and send the deletes
+/// queued for whatever that manifest does not name (GPU-422). Nothing at all
+/// when nothing is whole: the remote stays on its last point.
+fn put_up(
+    manifest: &crate::manifest::Manifest,
+    there: &HashSet<String>,
+    remote: &Arc<dyn StorageBackend>,
+    deletes: &Arc<PendingDeletes>,
+) -> Result<()> {
+    let mut kept = manifest.clone();
+    kept.snapshots
+        .retain(|s| s.finalized && data_files(s).iter().all(|file| there.contains(file)));
+    let ids: HashSet<Uuid> = kept.snapshots.iter().map(|s| s.id).collect();
+    kept.snapshots
+        .retain(|s| s.base_snapshot_id.is_none_or(|base| ids.contains(&base)));
+    if kept.snapshots.is_empty() {
+        return Ok(());
+    }
+    // The file of a snapshot's ranks never changes once it is finalised, so
+    // one the remote already has is not written again.
+    kept.ranks_written = kept
+        .snapshots
+        .iter()
+        .filter(|s| there.contains(&manifest_io::ranks_path(s.id)))
+        .map(|s| s.id)
+        .collect();
+    manifest_io::persist(remote.as_ref(), &mut kept)?;
+
+    let mut named: HashSet<String> = HashSet::new();
+    for snapshot in &kept.snapshots {
+        named.extend(data_files(snapshot));
+        named.insert(manifest_io::ranks_path(snapshot.id));
+    }
+    let (waiting, gone): (Vec<String>, Vec<String>) =
+        deletes.drain().into_iter().partition(|key| named.contains(key));
+    deletes.restore(waiting);
+    delete_all(remote, gone);
+    Ok(())
+}
+
 /// Copy a whole store from one side to the other, manifest last.
 ///
 /// The manifest names snapshots by id, so a destination holding the manifest
@@ -430,9 +617,10 @@ fn apply_deletes(remote: &Arc<dyn StorageBackend>, deletes: &Arc<PendingDeletes>
 /// store back from the bucket and died on `Checkpoint not found:
 /// snapshots/cdc000df-.../rank_0.pack`, a snapshot no prefix held.
 ///
-/// The periodic path in [`RemoteSyncer::notify_save`] already queues the two
-/// in this order. This is the forced path behind [`RemoteSyncer::sync_now`],
-/// which used to hand the whole store to a single walk and let the backend's
+/// The periodic path in [`RemoteSyncer::notify_save`] puts up a checkpoint
+/// whole ([`sync_checkpoint`]). This is the forced path behind
+/// [`RemoteSyncer::sync_now`], at the end of a run, when the store has stopped
+/// changing. It used to hand the whole store to a single walk and let the backend's
 /// `list("")` order decide what went up first — so the manifest could, and
 /// did, arrive alone.
 ///
@@ -901,7 +1089,9 @@ mod tests {
         let dst: Arc<dyn StorageBackend> =
             Arc::new(LocalStorage::new_unaligned(dst_dir.path()).unwrap());
 
-        src.put("manifest.json", b"test").unwrap();
+        // A real store: the periodic sync puts up a checkpoint whole, so it
+        // reads the manifest it uploads (GPU-422).
+        saved(&src, &[0]);
 
         let mut syncer = RemoteSyncer::new(
             Arc::clone(&src),
@@ -922,6 +1112,136 @@ mod tests {
         assert!(dst.exists("manifest.json").unwrap());
 
         syncer.shutdown();
+    }
+
+    /// A store on `storage` holding `steps`, saved by a coordinator with no
+    /// remote, closed when this returns.
+    fn saved(storage: &Arc<dyn StorageBackend>, steps: &[u64]) {
+        saved_with(storage, steps, None);
+    }
+
+    fn saved_with(storage: &Arc<dyn StorageBackend>, steps: &[u64], keep: Option<usize>) {
+        use crate::coordinator::{Coordinator, CoordinatorConfig};
+        use crate::manifest::RetentionPolicy;
+        use crate::tensor::TensorData;
+
+        let config = CoordinatorConfig {
+            retention: RetentionPolicy {
+                max_full_snapshots: 5,
+                max_deltas_per_full: 1000,
+                full_snapshot_every_steps: 1000,
+                max_total_snapshots: keep,
+            },
+            ..Default::default()
+        };
+        let coord = Coordinator::new(Arc::clone(storage), config).unwrap();
+        for &step in steps {
+            let mut data = vec![3u8; 4096];
+            data[0] = step as u8;
+            data[(step as usize * 31) % 4096] ^= 0xff;
+            coord
+                .save(step, vec![TensorData { name: "w".into(), shape: vec![4096], dtype: "uint8".into(), data }], Default::default())
+                .unwrap();
+        }
+        coord.flush().unwrap();
+    }
+
+    /// The steps the remote's manifest names, after checking that the remote
+    /// holds every data file of each.
+    fn whole_on(remote: &Arc<dyn StorageBackend>) -> Vec<u64> {
+        let Some(manifest) = manifest_io::load(remote.as_ref(), None).unwrap() else {
+            return Vec::new();
+        };
+        let there: HashSet<String> = remote.list("snapshots").unwrap().into_iter().collect();
+        for snapshot in &manifest.snapshots {
+            for file in data_files(snapshot) {
+                assert!(there.contains(&file), "the remote's manifest names {file}, which it does not hold");
+            }
+        }
+        manifest.snapshots.iter().map(|s| s.step).collect()
+    }
+
+    /// GPU-422. A snapshot whose pack the window deleted while the sync ran
+    /// is not named by the manifest put on the remote; the newest and the full
+    /// it stands on are, and a delta is never named without its base.
+    #[test]
+    fn a_checkpoint_sync_names_only_what_the_remote_holds() {
+        let (_a, _b, local, remote) = two_stores();
+        saved(&local, &[1, 2, 3, 4]);
+        let manifest = manifest_io::load(local.as_ref(), None).unwrap().unwrap();
+        let middle = manifest.snapshots.iter().find(|s| s.step == 2).unwrap();
+        for file in data_files(middle) {
+            local.delete(&file).unwrap();
+        }
+
+        sync_checkpoint(&local, &remote, &nothing_deleted()).unwrap();
+
+        assert_eq!(whole_on(&remote), vec![1, 3, 4]);
+    }
+
+    /// GPU-422. A sync that cannot put up anything whole - every file it
+    /// listed gone by the time it read them, the window having moved on -
+    /// leaves the remote's manifest as it was, and the deletes the window
+    /// queued for the files that manifest names wait.
+    #[test]
+    fn a_sync_with_nothing_whole_leaves_the_remote_on_its_last_point() {
+        let (_a, _b, local, remote) = two_stores();
+        saved(&local, &[1, 2]);
+        sync_checkpoint(&local, &remote, &nothing_deleted()).unwrap();
+        assert_eq!(whole_on(&remote), vec![1, 2]);
+
+        // The window moves on: a newer step is saved, the steps above leave
+        // the disk with their remote copies queued for deletion, and the new
+        // one vanishes too before this sync can read it.
+        saved(&local, &[3]);
+        let deletes = Arc::new(PendingDeletes::default());
+        let now = manifest_io::load(local.as_ref(), None).unwrap().unwrap();
+        for snapshot in &now.snapshots {
+            for file in data_files(snapshot) {
+                local.delete(&file).unwrap();
+                if snapshot.step != 3 {
+                    deletes.push(file);
+                }
+            }
+        }
+
+        sync_checkpoint(&local, &remote, &deletes).unwrap();
+
+        assert_eq!(whole_on(&remote), vec![1, 2], "the remote lost its last point");
+        assert!(!deletes.drain().is_empty(), "the deletes of what the remote still names were sent");
+    }
+
+    /// GPU-422. Once a newer point is up, what only the older one named is
+    /// deleted from the remote, and nothing the newer one names.
+    #[test]
+    fn a_newer_point_up_lets_the_older_go() {
+        let (_a, _b, local, remote) = two_stores();
+        saved_with(&local, &[1, 2, 3], Some(2));
+        sync_checkpoint(&local, &remote, &nothing_deleted()).unwrap();
+        let first: HashSet<String> = remote.list("snapshots").unwrap().into_iter().collect();
+
+        let deletes = Arc::new(PendingDeletes::default());
+        for file in &first {
+            if local.get(file).is_err() {
+                deletes.push(file.clone());
+            }
+        }
+        saved_with(&local, &[4, 5], Some(2));
+        let gone_here: Vec<String> = first.iter().filter(|f| local.get(f).is_err()).cloned().collect();
+        for file in &gone_here {
+            deletes.push(file.clone());
+        }
+
+        sync_checkpoint(&local, &remote, &deletes).unwrap();
+
+        let named = whole_on(&remote);
+        assert!(named.contains(&5), "the newest step is not on the remote: {named:?}");
+        let there: HashSet<String> = remote.list("snapshots").unwrap().into_iter().collect();
+        for file in &gone_here {
+            let manifest = manifest_io::load(remote.as_ref(), None).unwrap().unwrap();
+            let still_named = manifest.snapshots.iter().any(|s| data_files(s).contains(file));
+            assert_eq!(there.contains(file), still_named, "{file}");
+        }
     }
 
     fn two_stores() -> (tempfile::TempDir, tempfile::TempDir, Arc<dyn StorageBackend>, Arc<dyn StorageBackend>)

@@ -3087,3 +3087,143 @@ fn retention_leaves_no_snapshot_directory_behind() {
         .collect();
     assert_eq!(on_disk, kept);
 }
+
+// ─── A remote slower than the saves (GPU-422) ───────────────────────
+
+/// A remote that takes `delay` for every write, as a bucket across the
+/// internet does next to a local disk.
+struct SlowRemote {
+    inner: LocalStorage,
+    delay: std::time::Duration,
+}
+
+impl StorageBackend for SlowRemote {
+    fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+        thread::sleep(self.delay);
+        self.inner.put(rel_path, data)
+    }
+    fn put_exact(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+        thread::sleep(self.delay);
+        self.inner.put_exact(rel_path, data)
+    }
+    fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+        self.inner.get(rel_path)
+    }
+    fn exists(&self, rel_path: &str) -> Result<bool> {
+        self.inner.exists(rel_path)
+    }
+    fn delete(&self, rel_path: &str) -> Result<()> {
+        self.inner.delete(rel_path)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+/// A state that changes everywhere at every step, as AdamW's moments do: a
+/// delta of it weighs what a full does.
+fn churning_state(step: u64) -> Vec<TensorData> {
+    let mut seed = step.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let data = (0..32_768)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        })
+        .collect();
+    vec![TensorData {
+        name: "w".into(),
+        shape: vec![32_768],
+        dtype: "uint8".into(),
+        data,
+    }]
+}
+
+/// How many snapshots the remote's manifest names, after checking that the
+/// remote holds every data file of each. The files are listed before the
+/// manifest is read and again after, and a file counts if either listing has
+/// it: a sync running alongside may upload a newer manifest and its files, or
+/// delete what only an older one named, between the reads, and neither is a
+/// remote naming what it lacks.
+fn remote_names_only_what_it_holds(remote: &Arc<dyn StorageBackend>) -> usize {
+    let before: std::collections::HashSet<String> = remote.list("snapshots").unwrap().into_iter().collect();
+    let Some(manifest) = crate::manifest_io::load(remote.as_ref(), None).unwrap() else {
+        return 0;
+    };
+    let after: std::collections::HashSet<String> = remote.list("snapshots").unwrap().into_iter().collect();
+    for snapshot in &manifest.snapshots {
+        for entry in snapshot.ranks.values() {
+            for file in entry.pack_file.iter() {
+                assert!(
+                    before.contains(file) || after.contains(file),
+                    "the remote's manifest names {file} (step {}), which the remote does not hold",
+                    snapshot.step
+                );
+            }
+        }
+    }
+    manifest.snapshots.len()
+}
+
+/// GPU-422. A delta at every step, saved faster than the remote takes them:
+/// on 2026-11-14 a node did this for seventeen minutes and left a bucket
+/// with no checkpoint in it. Whenever it is looked at, the remote must hold
+/// a manifest it can load - fewer steps than the disk, never a manifest
+/// naming what it lacks - and a machine starting from it must resume.
+#[test]
+fn a_remote_slower_than_the_saves_always_holds_a_checkpoint_it_can_load() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote: Arc<dyn StorageBackend> = Arc::new(SlowRemote {
+        inner: LocalStorage::new(remote_dir.path()).unwrap(),
+        delay: std::time::Duration::from_millis(15),
+    });
+    let config = || CoordinatorConfig {
+        compression: CompressionAlgo::Zstd { level: 1 },
+        // A window of a few steps over one full, as Ravex keeps a delta per
+        // step: the window moves on long before a sync of it is done.
+        retention: RetentionPolicy {
+            max_full_snapshots: 5,
+            max_deltas_per_full: 1000,
+            full_snapshot_every_steps: 1000,
+            max_total_snapshots: Some(5),
+        },
+        remote_storage: Some(Arc::clone(&remote)),
+        remote_sync: Some(crate::remote_sync::RemoteSyncConfig {
+            sync_every_n_saves: 2,
+        }),
+        ..Default::default()
+    };
+    let disk = tempfile::tempdir().unwrap();
+    let local: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(disk.path()).unwrap());
+    let coord = Coordinator::new(local, config()).unwrap();
+    // Once the remote has held a point to resume from, it must hold one at
+    // every moment after: the old sync left it with none for most of a run,
+    // and with none when the machine went.
+    let mut held_one = false;
+    for step in 0..60 {
+        coord.save(step, churning_state(step), HashMap::new()).unwrap();
+        // Read twice before calling it empty: a read can fall between a newer
+        // manifest going up and the files only the older one named going.
+        let mut named = remote_names_only_what_it_holds(&remote);
+        if named == 0 && held_one {
+            thread::sleep(std::time::Duration::from_millis(5));
+            named = remote_names_only_what_it_holds(&remote);
+        }
+        assert!(named > 0 || !held_one, "after step {step} the remote holds nothing to resume from");
+        held_one |= named > 0;
+    }
+    assert!(held_one, "no sync ever left the remote a point to resume from");
+    // The machine goes, as a preempted one does: no final sync of the whole
+    // store, only the periodic ones already asked for.
+    drop(coord);
+
+    assert!(
+        remote_names_only_what_it_holds(&remote) > 0,
+        "nothing the remote holds can be resumed from"
+    );
+    let (_disk, _local, back) = restored(config());
+    back.load_latest().unwrap();
+    let newest = back.list_snapshots().iter().map(|s| s.step).max().unwrap();
+    assert!(newest > 0, "the remote's newest step is {newest}");
+}
