@@ -11,8 +11,8 @@
 # the same version and are what actually runs the gate; this makes a
 # contributor's rustup agree with it rather than find out later.
 #
-# The patch number is not decoration. Inside `rust:1.98.1-bookworm` the
-# installed toolchain is named `1.98.1-x86_64-unknown-linux-gnu`, so a
+# The patch number is not decoration. Inside `rust:1.99.1-bookworm` the
+# installed toolchain is named `1.99.1-x86_64-unknown-linux-gnu`, so a
 # `channel = "1.98"` here does not match it: rustup syncs the 1.98 channel and
 # downloads a second copy of the same compiler, on every job of every workflow.
 # Measured in that container: 31s and four components against 1.4s. Both the
@@ -38,5 +38,5 @@
 # repository therefore passes `--profile minimal --component clippy`.
 #
 [toolchain]
-channel = "1.98.1"
+channel = "1.99.1"
 components = ["clippy"]

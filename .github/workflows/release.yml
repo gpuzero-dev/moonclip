@@ -61,7 +61,7 @@ jobs:
       # Cargo already inside, so no rustup step. The verification build compiles
       # without `extension-module`, so it needs no Python interpreter to link
       # against.
-      image: rust:1.98.1-bookworm
+      image: rust:1.99.1-bookworm
     steps:
       # curl for the crates.io index lookup below; the base image is expected
       # to carry both, but a release is the wrong place to find out otherwise.
@@ -206,7 +206,7 @@ jobs:
       image: quay.io/pypa/manylinux_2_28_x86_64
     steps:
       # The manylinux image carries the Python interpreters, not a Rust
-      # toolchain — the `crate` job gets cargo from `rust:1.98.1-bookworm`, and
+      # toolchain — the `crate` job gets cargo from `rust:1.99.1-bookworm`, and
       # `wheels` installs it here for the same reason. This job needed it too
       # and did not say so: `maturin sdist` shells out to `cargo metadata` to
       # read the crate, so it failed with "Do you have cargo in your PATH?"
@@ -215,7 +215,7 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
+            | sh -s -- -y --default-toolchain 1.99.1 --profile minimal --component clippy
 
       - name: Checkout
         uses: actions/checkout@v5
@@ -307,7 +307,7 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
+            | sh -s -- -y --default-toolchain 1.99.1 --profile minimal --component clippy
 
       - name: Checkout
         uses: actions/checkout@v5
@@ -442,7 +442,7 @@ jobs:
           # installed here, with clippy, before maturin starts cargo several
           # times at once: left to cargo, two of them race to add the same
           # component (see rust-toolchain.toml).
-          rustup toolchain install 1.98.1 --profile minimal --component clippy
+          rustup toolchain install 1.99.1 --profile minimal --component clippy
           python -m pip install --quiet maturin twine
           maturin build --release --locked --out dist --interpreter python
           ls -la dist/
