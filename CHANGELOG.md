@@ -9,6 +9,10 @@
   before the first sync. Against the step being saved it says whether the
   link keeps up with what is written, which nothing on the save path sees:
   Ravex moves a run to fulls when the bucket keeps falling behind.
+- **`MoonclipManager.remote_steps()` (GPU-422)**: every step the remote
+  holds a whole checkpoint of, the points a resume or a fork from it can
+  start at. The local disk can hold many more, a window of deltas the link
+  has not carried, and Ravex offered those as resume points.
 
 ## 0.3.4 — 2026-11-14
 

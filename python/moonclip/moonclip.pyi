@@ -195,6 +195,18 @@ class MoonclipManager:
         further behind at every sync.
         """
         ...
+    def remote_steps(self) -> Optional[List[int]]:
+        """
+        Every step the remote holds a whole checkpoint of, as this process
+        last put them up; None with no remote, or before the first sync.
+
+        The points a resume or a fork from the remote can start at (GPU-422).
+        The local disk can hold many more - a window of deltas the link has
+        not carried yet - and a list offered from it named points the remote
+        did not have.
+        """
+        ...
+
     def last_queue_wait(self) -> float:
         """
         Seconds the last save_tensors() waited for the previous save to drain.

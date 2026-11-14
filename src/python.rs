@@ -525,6 +525,13 @@ impl MoonclipManager {
         self.inner.remote_step()
     }
 
+    /// Every step the remote holds a whole checkpoint of, as this process
+    /// last put them up; None with no remote, or before the first sync
+    /// (GPU-422): the points a resume or a fork from the remote can start at.
+    fn remote_steps(&self) -> Option<Vec<u64>> {
+        self.inner.remote_steps()
+    }
+
     /// Create a new snapshot (multi-rank: rank 0 only).
     #[pyo3(signature = (step, metadata = None))]
     fn create_snapshot(&self, step: u64, metadata: Option<Bound<'_, PyDict>>) -> PyResult<String> {

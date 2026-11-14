@@ -3254,4 +3254,14 @@ fn the_remote_step_follows_what_the_syncs_put_up() {
         thread::sleep(std::time::Duration::from_millis(20));
     }
     assert_eq!(coord.remote_step(), Some(3));
+    let steps = coord.remote_steps().unwrap();
+    assert!(steps.contains(&3) && steps.iter().all(|s| *s <= 3), "{steps:?}");
+
+    // A sync of the whole store, as at the end of a run, puts up every step.
+    coord.sync_now().unwrap();
+    let mut all = coord.remote_steps().unwrap();
+    all.sort();
+    let mut here: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
+    here.sort();
+    assert_eq!(all, here);
 }

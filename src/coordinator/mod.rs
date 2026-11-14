@@ -313,6 +313,13 @@ impl Coordinator {
         self.core.syncer.as_ref().and_then(|syncer| syncer.remote_step())
     }
 
+    /// Every step the remote holds a whole checkpoint of, as this process
+    /// last put them up; `None` with no remote, or before the first sync
+    /// (GPU-422). See [`RemoteSyncer::remote_steps`].
+    pub fn remote_steps(&self) -> Option<Vec<u64>> {
+        self.core.syncer.as_ref().and_then(|syncer| syncer.remote_steps())
+    }
+
     pub fn last_queue_wait(&self) -> Duration {
         match self.saver {
             Some(ref saver) => Duration::from_nanos(saver.last_wait.load(Ordering::Relaxed)),
