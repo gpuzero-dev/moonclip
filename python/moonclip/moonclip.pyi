@@ -184,6 +184,17 @@ class MoonclipManager:
         """
         ...
 
+    def remote_step(self) -> Optional[int]:
+        """
+        The newest step the remote holds a whole checkpoint of, as this
+        process last put it up; None with no remote, or before the first sync.
+
+        Against the step being saved it says whether the link to the remote
+        keeps up with what is written (GPU-418): a periodic sync puts up the
+        newest point first, and a link slower than the saves leaves this
+        further behind at every sync.
+        """
+        ...
     def last_queue_wait(self) -> float:
         """
         Seconds the last save_tensors() waited for the previous save to drain.

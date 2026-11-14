@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -157,6 +157,9 @@ pub struct RemoteSyncer {
     /// Raised when the worker loop leaves by any route other than the
     /// `Shutdown` command. See [`RemoteSyncer::is_dead`].
     dead: Arc<std::sync::atomic::AtomicBool>,
+    /// The newest step the remote's manifest names, as this process last put
+    /// it up; -1 before the first. See [`RemoteSyncer::remote_step`].
+    remote_step: Arc<AtomicI64>,
 }
 
 impl RemoteSyncer {
@@ -175,6 +178,8 @@ impl RemoteSyncer {
         let sync_every = config.sync_every_n_saves;
         let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dead_worker = Arc::clone(&dead);
+        let remote_step = Arc::new(AtomicI64::new(-1));
+        let remote_step_worker = Arc::clone(&remote_step);
 
         let handle = thread::Builder::new()
             .name("moonclip-remote-sync".into())
@@ -214,7 +219,7 @@ impl RemoteSyncer {
                         }
                         SyncCommand::Checkpoint => {
                             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                                sync_checkpoint(&local, &remote, &deletes)
+                                sync_checkpoint(&local, &remote, &deletes, &remote_step_worker)
                             }));
                             match outcome {
                                 Ok(Ok(copied)) => copied.log("snapshots"),
@@ -265,7 +270,17 @@ impl RemoteSyncer {
             save_counter: std::sync::atomic::AtomicU64::new(0),
             sync_every,
             dead,
+            remote_step,
         }
+    }
+
+    /// The newest step a resume from the remote would find: the newest the
+    /// manifest this process last put up names, or `None` before the first
+    /// (GPU-418). Against the step being saved it says how far behind the
+    /// saves the remote is - whether the link keeps up with what is written,
+    /// which nothing on the save path can see.
+    pub fn remote_step(&self) -> Option<u64> {
+        u64::try_from(self.remote_step.load(Ordering::Relaxed)).ok()
     }
 
     /// Whether the worker thread is gone while it was still meant to be
@@ -500,6 +515,7 @@ fn sync_checkpoint(
     local: &Arc<dyn StorageBackend>,
     remote: &Arc<dyn StorageBackend>,
     deletes: &Arc<PendingDeletes>,
+    remote_step: &AtomicI64,
 ) -> Result<Copied> {
     let Some(manifest) = manifest_io::load(local.as_ref(), None)? else {
         return Ok(Copied::default());
@@ -563,7 +579,9 @@ fn sync_checkpoint(
         // What the remote holds now, asked of the remote: a copy that did not
         // make it is one the manifest must not name.
         there = remote.list("snapshots")?.into_iter().collect();
-        put_up(&manifest, &there, remote, deletes)?;
+        if let Some(step) = put_up(&manifest, &there, remote, deletes)? {
+            remote_step.store(step as i64, Ordering::Relaxed);
+        }
     }
     Ok(copied)
 }
@@ -571,13 +589,14 @@ fn sync_checkpoint(
 /// Put on the remote `manifest` kept to the snapshots whose data `there`
 /// holds - a delta whose base is not kept goes too - and send the deletes
 /// queued for whatever that manifest does not name (GPU-422). Nothing at all
-/// when nothing is whole: the remote stays on its last point.
+/// when nothing is whole: the remote stays on its last point. The newest step
+/// the manifest put up names, if one went up.
 fn put_up(
     manifest: &crate::manifest::Manifest,
     there: &HashSet<String>,
     remote: &Arc<dyn StorageBackend>,
     deletes: &Arc<PendingDeletes>,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     let mut kept = manifest.clone();
     kept.snapshots
         .retain(|s| s.finalized && data_files(s).iter().all(|file| there.contains(file)));
@@ -585,7 +604,7 @@ fn put_up(
     kept.snapshots
         .retain(|s| s.base_snapshot_id.is_none_or(|base| ids.contains(&base)));
     if kept.snapshots.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     // The file of a snapshot's ranks never changes once it is finalised, so
     // one the remote already has is not written again.
@@ -606,7 +625,7 @@ fn put_up(
         deletes.drain().into_iter().partition(|key| named.contains(key));
     deletes.restore(waiting);
     delete_all(remote, gone);
-    Ok(())
+    Ok(kept.snapshots.iter().map(|s| s.step).max())
 }
 
 /// Copy a whole store from one side to the other, manifest last.
@@ -1174,7 +1193,7 @@ mod tests {
             local.delete(&file).unwrap();
         }
 
-        sync_checkpoint(&local, &remote, &nothing_deleted()).unwrap();
+        sync_checkpoint(&local, &remote, &nothing_deleted(), &AtomicI64::new(-1)).unwrap();
 
         assert_eq!(whole_on(&remote), vec![1, 3, 4]);
     }
@@ -1187,7 +1206,7 @@ mod tests {
     fn a_sync_with_nothing_whole_leaves_the_remote_on_its_last_point() {
         let (_a, _b, local, remote) = two_stores();
         saved(&local, &[1, 2]);
-        sync_checkpoint(&local, &remote, &nothing_deleted()).unwrap();
+        sync_checkpoint(&local, &remote, &nothing_deleted(), &AtomicI64::new(-1)).unwrap();
         assert_eq!(whole_on(&remote), vec![1, 2]);
 
         // The window moves on: a newer step is saved, the steps above leave
@@ -1205,7 +1224,7 @@ mod tests {
             }
         }
 
-        sync_checkpoint(&local, &remote, &deletes).unwrap();
+        sync_checkpoint(&local, &remote, &deletes, &AtomicI64::new(-1)).unwrap();
 
         assert_eq!(whole_on(&remote), vec![1, 2], "the remote lost its last point");
         assert!(!deletes.drain().is_empty(), "the deletes of what the remote still names were sent");
@@ -1217,7 +1236,7 @@ mod tests {
     fn a_newer_point_up_lets_the_older_go() {
         let (_a, _b, local, remote) = two_stores();
         saved_with(&local, &[1, 2, 3], Some(2));
-        sync_checkpoint(&local, &remote, &nothing_deleted()).unwrap();
+        sync_checkpoint(&local, &remote, &nothing_deleted(), &AtomicI64::new(-1)).unwrap();
         let first: HashSet<String> = remote.list("snapshots").unwrap().into_iter().collect();
 
         let deletes = Arc::new(PendingDeletes::default());
@@ -1232,7 +1251,7 @@ mod tests {
             deletes.push(file.clone());
         }
 
-        sync_checkpoint(&local, &remote, &deletes).unwrap();
+        sync_checkpoint(&local, &remote, &deletes, &AtomicI64::new(-1)).unwrap();
 
         let named = whole_on(&remote);
         assert!(named.contains(&5), "the newest step is not on the remote: {named:?}");

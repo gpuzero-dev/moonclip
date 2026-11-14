@@ -3227,3 +3227,31 @@ fn a_remote_slower_than_the_saves_always_holds_a_checkpoint_it_can_load() {
     let newest = back.list_snapshots().iter().map(|s| s.step).max().unwrap();
     assert!(newest > 0, "the remote's newest step is {newest}");
 }
+
+/// GPU-418: the newest step the remote holds, for a caller to tell whether
+/// its link keeps up with the saves. None without a remote, and before the
+/// first sync; the newest step once the syncs have caught up.
+#[test]
+fn the_remote_step_follows_what_the_syncs_put_up() {
+    let disk = tempfile::tempdir().unwrap();
+    let alone = Coordinator::new(Arc::new(LocalStorage::new(disk.path()).unwrap()), CoordinatorConfig::default()).unwrap();
+    alone.save(1, evolving_state(1), HashMap::new()).unwrap();
+    alone.flush().unwrap();
+    assert_eq!(alone.remote_step(), None);
+    drop(alone);
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(remote_dir.path()).unwrap());
+    let other = tempfile::tempdir().unwrap();
+    let coord = Coordinator::new(Arc::new(LocalStorage::new(other.path()).unwrap()), remote_config(&remote)).unwrap();
+    assert_eq!(coord.remote_step(), None);
+    for step in 0..4 {
+        coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while coord.remote_step() != Some(3) && std::time::Instant::now() < deadline {
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(coord.remote_step(), Some(3));
+}

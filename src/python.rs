@@ -517,6 +517,14 @@ impl MoonclipManager {
         self.inner.last_queue_wait().as_secs_f64()
     }
 
+    /// The newest step the remote holds a whole checkpoint of, as this
+    /// process last put it up; None with no remote, or before the first sync
+    /// (GPU-418). Against the step being saved it says whether the link keeps
+    /// up with what is written.
+    fn remote_step(&self) -> Option<u64> {
+        self.inner.remote_step()
+    }
+
     /// Create a new snapshot (multi-rank: rank 0 only).
     #[pyo3(signature = (step, metadata = None))]
     fn create_snapshot(&self, step: u64, metadata: Option<Bound<'_, PyDict>>) -> PyResult<String> {

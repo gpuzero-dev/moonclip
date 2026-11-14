@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`MoonclipManager.remote_step()` (GPU-418)**: the newest step the remote
+  holds a whole checkpoint of, as this process last put it up, or `None`
+  before the first sync. Against the step being saved it says whether the
+  link keeps up with what is written, which nothing on the save path sees:
+  Ravex moves a run to fulls when the bucket keeps falling behind.
+
 ## 0.3.4 — 2026-11-14
 
 ### Fixed
