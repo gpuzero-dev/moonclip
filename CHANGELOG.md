@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.6 — 2026-11-16
+
+### Fixed
+
+- **A periodic sync no longer spends most of its time on small files
+  (GPU-422).** Each snapshot's `ranks.json` was left to the manifest's write,
+  which put them on the remote one at a time after the packs: measured from a
+  vast.ai node to R2, ~80 requests and ~45 s of a ~70 s sync, while the sync
+  thread held up the metrics and every later sync. They now go with their
+  packs, among the copies that run side by side.
+
 ## 0.3.5 — 2026-11-14
 
 ### Added
