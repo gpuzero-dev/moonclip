@@ -581,7 +581,16 @@ fn sync_checkpoint(
             let Some(snapshot) = by_id.get(id) else {
                 continue;
             };
-            for file in data_files(snapshot) {
+            // The snapshot's ranks file goes with its packs, among the copies
+            // that run side by side (GPU-422): left to the manifest's
+            // `persist`, the window's were written one at a time after the
+            // copies - ~80 requests, ~45 s from a vast.ai node to R2 on
+            // 2026-11-16, while the sync thread held up the metrics and every
+            // later sync. Only when this disk has it: one not written here
+            // yet is still `persist`'s to write.
+            let ranks = manifest_io::ranks_path(*id);
+            let ranks = sizes.contains_key(&ranks).then_some(ranks);
+            for file in data_files(snapshot).into_iter().chain(ranks) {
                 if there.contains(&file) {
                     copied.skipped += 1;
                 } else if !wanted.iter().any(|(listed, _)| *listed == file) {
@@ -1284,6 +1293,61 @@ mod tests {
             let still_named = manifest.snapshots.iter().any(|s| data_files(s).contains(file));
             assert_eq!(there.contains(file), still_named, "{file}");
         }
+    }
+
+    /// A remote that tells the writes `copy_files` makes (`put_exact`) from
+    /// the ones made one at a time (`put`).
+    struct PutsSeen {
+        inner: Arc<dyn StorageBackend>,
+        one_by_one: Mutex<Vec<String>>,
+    }
+
+    impl StorageBackend for PutsSeen {
+        fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+            self.one_by_one.lock().unwrap().push(rel_path.to_string());
+            self.inner.put(rel_path, data)
+        }
+        fn put_exact(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+            self.inner.put_exact(rel_path, data)
+        }
+        fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+            self.inner.get(rel_path)
+        }
+        fn exists(&self, rel_path: &str) -> Result<bool> {
+            self.inner.exists(rel_path)
+        }
+        fn delete(&self, rel_path: &str) -> Result<()> {
+            self.inner.delete(rel_path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    /// GPU-422. Each snapshot's `ranks.json` goes up with its packs, in the
+    /// copies that run side by side, not one at a time after them. Measured
+    /// on a vast.ai node to R2 on 2026-11-16: the window's ~80 files written
+    /// one by one in `put_up` were ~45 s of a ~70 s sync, during which the
+    /// sync thread held up the metrics and every later sync.
+    #[test]
+    fn a_checkpoint_sync_copies_the_ranks_files_with_the_packs() {
+        let (_a, _b, local, inner) = two_stores();
+        saved(&local, &[1, 2, 3, 4]);
+        let seen = Arc::new(PutsSeen { inner, one_by_one: Mutex::new(Vec::new()) });
+        let remote: Arc<dyn StorageBackend> = Arc::clone(&seen) as Arc<dyn StorageBackend>;
+
+        sync_checkpoint(&local, &remote, &nothing_deleted(), &Mutex::new(None)).unwrap();
+
+        assert_eq!(whole_on(&remote), vec![1, 2, 3, 4]);
+        let ranks: Vec<String> = seen
+            .one_by_one
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|key| key.ends_with(manifest_io::RANKS_FILE))
+            .cloned()
+            .collect();
+        assert!(ranks.is_empty(), "written one at a time after the copies: {ranks:?}");
     }
 
     fn two_stores() -> (tempfile::TempDir, tempfile::TempDir, Arc<dyn StorageBackend>, Arc<dyn StorageBackend>)
