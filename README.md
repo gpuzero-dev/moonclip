@@ -59,8 +59,8 @@ pip install moonclip
 ```
 
 Wheels exist for Linux on x86_64 and aarch64 (manylinux_2_28, so GH200,
-Grace and Graviton too) and for macOS on Apple silicon, CPython 3.11-3.14;
-up to 0.3.1, for Linux x86_64 only. On Python 3.10 or older `pip` may install 0.0.8
+Grace and Graviton too) and for macOS on Apple silicon, CPython 3.11-3.14.
+On Python 3.10 or older `pip` may install 0.0.8
 or earlier instead of refusing, since those said they ran on 3.9: check
 `python --version`, or ask for `"moonclip>=0.3"`, which turns that into an
 error naming the Python version. On any other platform `pip` finds no wheel and
@@ -158,12 +158,15 @@ sit next to the checkpoints.
 
 `python examples/compare_savers.py` trains the same model with each saver and
 prints this table. One run, 50M parameters with AdamW in fp32, a save every 5
-steps, 8 saves, on a 4-core x86_64 cloud VM with no GPU, torch 2.15:
+steps, 8 saves, on a 4-core x86_64 cloud VM with no GPU, torch 2.15. Only the
+first time column stops training. The second is Moonclip's background write:
+it runs while training goes on, ends after the last save, and only `flush()`
+waits for it.
 
-| saver | blocked per save (median) | flush at the end | written per save |
+| saver | blocked per save (median) | background write, after the last save | written per save |
 |---|---|---|---|
-| `torch.save` | 2,694 ms | - | 576 MiB |
-| torch DCP (`dcp.save`) | 1,135 ms | - | 577 MiB |
+| `torch.save` | 2,694 ms | none | 576 MiB |
+| torch DCP (`dcp.save`) | 1,135 ms | none | 577 MiB |
 | Moonclip | 226 ms | 4,311 ms | 467 MiB |
 
 "Blocked" is what the training loop waits for: the whole save for the first
@@ -177,15 +180,16 @@ transfer. Run it on your own model and machine (`--width`, `--layers`,
 
 ## Next to other tools
 
+- **Lightning, Accelerate, the Hugging Face Trainer:** Moonclip does not plug
+  into their checkpoint hooks, which keep calling `torch.save`, safetensors or
+  DCP. To use Moonclip with any of them, call `CheckpointManager.save()`
+  yourself where you want a checkpoint, or put
+  [Ravex](https://github.com/gpuzero-dev/ravex) around the training function.
+  Otherwise, keep their own checkpointing.
 - **torch DCP** saves a sharded model in parallel and reloads at another world
   size; it writes the whole state every time and, unless asked for its async
   mode, blocks while it does. Moonclip writes only what changed, in the
   background, and keeps a history of checkpoints rather than one.
-- **Lightning, Accelerate, the Hugging Face Trainer** call `torch.save`,
-  safetensors or DCP from their own checkpoint hooks; Moonclip does not plug
-  into them. To use it with any of them, call `CheckpointManager.save()` where
-  you want a checkpoint, or put [Ravex](https://github.com/gpuzero-dev/ravex)
-  around the training function.
 - **W&B, MLflow** track metrics and keep artifacts. They live beside Moonclip:
   the checkpoints stay in your directory or bucket, and the tracker records
   what you log.
@@ -237,8 +241,8 @@ Moonclip is 0.x. Within it:
 - Python 3.11 and later, each for as long as CPython supports it; a version
   is dropped in a minor release. Rust: the `rust-version` in `Cargo.toml`.
 
-Pin a minor version (`moonclip~=0.3.1`) on machines that share a store, so
-that none of them writes a format another cannot read.
+Pin a minor version (`moonclip~=X.Y.0`, with the minor you run) on machines
+that share a store, so that none of them writes a format another cannot read.
 
 ## Moonclip and Ravex
 
