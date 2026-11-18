@@ -28,6 +28,18 @@ fn make_coordinator(dir: &std::path::Path) -> Coordinator {
     Coordinator::new(storage, config).unwrap()
 }
 
+/// Zero full snapshots kept is every checkpoint deleted as it is written.
+#[test]
+fn a_retention_that_keeps_nothing_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let config = CoordinatorConfig {
+        retention: RetentionPolicy { max_full_snapshots: 0, ..Default::default() },
+        ..Default::default()
+    };
+    assert!(matches!(Coordinator::new(storage, config), Err(MoonclipError::Config(_))));
+}
+
 fn sample_tensors(seed: u8) -> Vec<TensorData> {
     vec![TensorData {
         name: "w".into(),

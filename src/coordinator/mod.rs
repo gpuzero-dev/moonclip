@@ -258,6 +258,16 @@ pub struct Coordinator {
 
 impl Coordinator {
     pub fn new(storage: Arc<dyn StorageBackend>, config: CoordinatorConfig) -> Result<Self> {
+        if config.retention.max_full_snapshots == 0 {
+            // Refused rather than obeyed: retention would evict every full
+            // snapshot the moment it was written, and a run finds nothing to
+            // resume from. Zero reads as "no limit" elsewhere, which is what
+            // whoever passes it most likely meant (GPU-462).
+            return Err(MoonclipError::Config(
+                "max_full_snapshots is 0, which keeps no checkpoint at all;                  keep at least 1, or a large number for no limit in practice"
+                    .into(),
+            ));
+        }
         let manifest = load_manifest(storage.as_ref(), &config)?;
 
         // Rank 0 only, for the same reason only rank 0 finalises: every rank

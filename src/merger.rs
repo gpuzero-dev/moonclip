@@ -761,17 +761,18 @@ pub(crate) fn do_full_merge_within(
 
             let current_data = match entry.storage {
                 TensorStorage::Full => {
-                    load_tensor_data(entry, source_snap, rank, storage, compression)?
+                    load_tensor_data(entry, source_snap, rank, storage)?
                 }
                 TensorStorage::Skipped => {
                     // Unchanged since the base, so the bytes are the base's.
-                    base_tensor_data(&base_snap, rank, &entry.name, storage, compression)?
+                    base_tensor_data(&base_snap, rank, &entry.name, storage)?
                 }
                 TensorStorage::DeltaXor => {
                     let base_raw =
-                        base_tensor_data(&base_snap, rank, &entry.name, storage, compression)?;
+                        base_tensor_data(&base_snap, rank, &entry.name, storage)?;
                     let compressed = load_compressed_data(entry, source_snap, rank, storage)?;
-                    let mut delta_bytes = compression::decompress(&compressed, compression)?;
+                    let mut delta_bytes =
+                        compression::decompress(&compressed, &source_snap.compression)?;
                     if entry.shuffled {
                         delta_bytes = crate::shuffle::unshuffle(
                             &delta_bytes,
@@ -783,8 +784,20 @@ pub(crate) fn do_full_merge_within(
                 TensorStorage::Alias => unreachable!("handled above"),
             };
 
-            // Store as full, at its place in the pack.
+            // Store as full, at its place in the pack - once the bytes are
+            // known to be the tensor's. A merge makes its result the truth
+            // and deletes what it read, so a bit flipped in a pack, or a
+            // delta applied over the wrong base, would otherwise be written
+            // into the one copy left, under a hash that vouches for it
+            // (GPU-462). A load checks the same hash; so nothing that would
+            // not load is ever merged.
             let raw_hash = hash_hex(&current_data);
+            if raw_hash != entry.hash_raw {
+                return Err(MoonclipError::IntegrityError {
+                    expected: entry.hash_raw.clone(),
+                    actual: raw_hash,
+                });
+            }
             let compressed = compression::compress(&current_data, compression)?;
             let compressed_hash = hash_hex(&compressed);
             total_compressed += compressed.len() as u64;
@@ -973,7 +986,6 @@ fn base_tensor_data(
     rank: u32,
     name: &str,
     storage: &Arc<dyn StorageBackend>,
-    compression: &CompressionAlgo,
 ) -> Result<Vec<u8>> {
     let base_rank = base_snap.ranks.get(&rank).ok_or_else(|| {
         MoonclipError::NotFound(format!("Rank {rank} is not in base snapshot {}", base_snap.id))
@@ -1001,7 +1013,7 @@ fn base_tensor_data(
                     MoonclipError::NotFound(format!("Alias '{current}' has no target"))
                 })?;
             }
-            _ => return load_tensor_data(entry, base_snap, rank, storage, compression),
+            _ => return load_tensor_data(entry, base_snap, rank, storage),
         }
     }
 
@@ -1011,17 +1023,21 @@ fn base_tensor_data(
     )))
 }
 
+/// A Full tensor's bytes, decompressed as the snapshot that holds them was
+/// written, which is not always how the run compresses today: a store
+/// written in zstd and opened again with no compression had its zstd bytes
+/// read as raw ones, merged, published under a hash of their own, and the
+/// true base and deltas deleted, here and in the bucket (GPU-462).
 fn load_tensor_data(
     entry: &TensorEntry,
     snap: &Snapshot,
     rank: u32,
     storage: &Arc<dyn StorageBackend>,
-    compression: &CompressionAlgo,
 ) -> Result<Vec<u8>> {
     match entry.storage {
         TensorStorage::Full => {
             let compressed = load_compressed_data(entry, snap, rank, storage)?;
-            compression::decompress(&compressed, compression)
+            compression::decompress(&compressed, &snap.compression)
         }
         _ => Err(MoonclipError::Delta(format!(
             "Merger can only process Full tensors, got {:?} for '{}'",
@@ -1175,6 +1191,18 @@ mod tests {
         }
     }
 
+    /// `snap` with the hash the save path records for a delta or a skipped
+    /// tensor: that of the tensor it stands for, not of the bytes stored for
+    /// it. It is what a load checks what it rebuilt against, and a merge too.
+    fn standing_for(mut snap: Snapshot, tensors: &[(&str, &[u8])]) -> Snapshot {
+        let rank = snap.ranks.get_mut(&0).unwrap();
+        for (name, bytes) in tensors {
+            let entry = rank.tensors.iter_mut().find(|t| t.name == *name).unwrap();
+            entry.hash_raw = hash_hex(bytes);
+        }
+        snap
+    }
+
     /// A base full snapshot plus `deltas` snapshots, each one a complete XOR
     /// against that same base — which is how the save path writes them, since
     /// `last_full_snapshot()` is the only thing that can be a base.
@@ -1216,11 +1244,14 @@ mod tests {
                     (name.clone(), xor, TensorStorage::DeltaXor)
                 })
                 .collect();
-            snapshots.push(packed_snapshot(
-                storage,
-                &delta_tensors,
-                Some(base_id),
-                d as u64,
+            let named: Vec<(&str, &[u8])> = base_tensors
+                .iter()
+                .zip(&finals)
+                .map(|((name, _, _), updated)| (name.as_str(), updated.as_slice()))
+                .collect();
+            snapshots.push(standing_for(
+                packed_snapshot(storage, &delta_tensors, Some(base_id), d as u64),
+                &named,
             ));
         }
 
@@ -1240,6 +1271,58 @@ mod tests {
         size: usize,
     ) -> (Manifest, Vec<Vec<u8>>) {
         delta_run(storage, count, size, 1)
+    }
+
+    /// A store written in zstd and opened again with another compression:
+    /// the snapshots are read as they were written, whatever the run writes
+    /// with now. Read with the run's, their zstd bytes were taken for the
+    /// tensors, merged, and the true base and deltas deleted (GPU-462).
+    #[test]
+    fn a_merge_reads_each_snapshot_as_it_was_compressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let (manifest, expected) = scenario(storage.as_ref(), 3, 20_000);
+        let manifest = Arc::new(Mutex::new(manifest));
+
+        let now = CompressionAlgo::None;
+        assert_eq!(
+            do_full_merge(&storage, &manifest, &now, &unread(), &no_remote()).unwrap(),
+            MergeOutcome::Merged
+        );
+
+        let m = manifest.lock().unwrap();
+        let merged = &m.snapshots[0];
+        assert!(matches!(merged.compression, CompressionAlgo::None));
+        let rank = merged.ranks.get(&0).unwrap();
+        for (i, want) in expected.iter().enumerate() {
+            let entry = rank.tensors.iter().find(|t| t.name == format!("w{i}")).unwrap();
+            assert_eq!(&load_tensor_data(entry, merged, 0, &storage).unwrap(), want);
+        }
+    }
+
+    /// What a merge read is checked against the hash a load would check,
+    /// before it replaces the only intact copy: a tensor that is not what
+    /// its entry says fails the merge and leaves every snapshot where it was.
+    #[test]
+    fn a_merge_of_bytes_that_are_not_the_tensors_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let (mut manifest, _) = scenario(storage.as_ref(), 2, 20_000);
+        // The newest delta's first tensor now says it is something else,
+        // which is all a flipped bit in its pack or its base comes to.
+        manifest.snapshots[1].ranks.get_mut(&0).unwrap().tensors[0].hash_raw = hash_hex(b"other");
+        let before: Vec<Uuid> = manifest.snapshots.iter().map(|s| s.id).collect();
+        let manifest = Arc::new(Mutex::new(manifest));
+
+        let failed = do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote());
+        assert!(matches!(failed, Err(MoonclipError::IntegrityError { .. })));
+
+        let m = manifest.lock().unwrap();
+        assert_eq!(m.snapshots.iter().map(|s| s.id).collect::<Vec<_>>(), before);
+        for snapshot in &m.snapshots {
+            let pack = snapshot.ranks[&0].pack_file.as_ref().unwrap();
+            assert!(storage.exists(pack).unwrap(), "{pack} was deleted by a merge that failed");
+        }
     }
 
     #[test]
@@ -1264,7 +1347,7 @@ mod tests {
                 .find(|t| t.name == format!("w{i}"))
                 .unwrap();
             assert_eq!(entry.storage, TensorStorage::Full);
-            let got = load_tensor_data(entry, merged, 0, &storage, &ZSTD3).unwrap();
+            let got = load_tensor_data(entry, merged, 0, &storage).unwrap();
             assert_eq!(&got, want, "tensor w{i} must survive the merge intact");
         }
     }
@@ -1399,7 +1482,7 @@ mod tests {
                 .iter()
                 .find(|t| t.name == format!("w{i}"))
                 .unwrap();
-            let got = load_tensor_data(entry, merged, 0, &storage, &ZSTD3).unwrap();
+            let got = load_tensor_data(entry, merged, 0, &storage).unwrap();
             assert_eq!(&got, want, "w{i} must read back as the newest delta wrote it");
         }
     }
@@ -1560,14 +1643,17 @@ mod tests {
         let base_id = base.id;
 
         // The delta carries w0 unchanged and the tensor the model just gained.
-        let delta = packed_snapshot(
-            storage.as_ref(),
-            &[
-                ("w0".into(), Vec::new(), TensorStorage::Skipped),
-                ("adapter".into(), adapter.clone(), TensorStorage::Full),
-            ],
-            Some(base_id),
-            1,
+        let delta = standing_for(
+            packed_snapshot(
+                storage.as_ref(),
+                &[
+                    ("w0".into(), Vec::new(), TensorStorage::Skipped),
+                    ("adapter".into(), adapter.clone(), TensorStorage::Full),
+                ],
+                Some(base_id),
+                1,
+            ),
+            &[("w0", &w0)],
         );
 
         let manifest = Arc::new(Mutex::new(Manifest {
@@ -1587,7 +1673,7 @@ mod tests {
             .iter()
             .find(|t| t.name == "adapter")
             .unwrap_or_else(|| panic!("'adapter' did not survive the merge; kept: {names:?}"));
-        let got = load_tensor_data(entry, merged, 0, &storage, &ZSTD3).unwrap();
+        let got = load_tensor_data(entry, merged, 0, &storage).unwrap();
         assert_eq!(got, adapter, "'adapter' survived the merge with the wrong bytes");
     }
 
@@ -1611,11 +1697,14 @@ mod tests {
 
         // The step after: the model no longer has `dropped`, so the save path
         // writes no entry for it at all.
-        let delta = packed_snapshot(
-            storage.as_ref(),
-            &[("kept".into(), Vec::new(), TensorStorage::Skipped)],
-            Some(base_id),
-            1,
+        let delta = standing_for(
+            packed_snapshot(
+                storage.as_ref(),
+                &[("kept".into(), Vec::new(), TensorStorage::Skipped)],
+                Some(base_id),
+                1,
+            ),
+            &[("kept", &noise(20_000, 1))],
         );
 
         let manifest = Arc::new(Mutex::new(Manifest {
@@ -1663,17 +1752,23 @@ mod tests {
             0,
         );
         let base_id = base.id;
-        let d1 = packed_snapshot(
-            storage.as_ref(),
-            &[("w".into(), xor, TensorStorage::DeltaXor)],
-            Some(base_id),
-            1,
+        let d1 = standing_for(
+            packed_snapshot(
+                storage.as_ref(),
+                &[("w".into(), xor, TensorStorage::DeltaXor)],
+                Some(base_id),
+                1,
+            ),
+            &[("w", &touched)],
         );
-        let d2 = packed_snapshot(
-            storage.as_ref(),
-            &[("w".into(), Vec::new(), TensorStorage::Skipped)],
-            Some(base_id),
-            2,
+        let d2 = standing_for(
+            packed_snapshot(
+                storage.as_ref(),
+                &[("w".into(), Vec::new(), TensorStorage::Skipped)],
+                Some(base_id),
+                2,
+            ),
+            &[("w", &original)],
         );
 
         let manifest = Arc::new(Mutex::new(Manifest {
@@ -1693,7 +1788,7 @@ mod tests {
             .iter()
             .find(|t| t.name == "w")
             .unwrap();
-        let got = load_tensor_data(entry, merged, 0, &storage, &ZSTD3).unwrap();
+        let got = load_tensor_data(entry, merged, 0, &storage).unwrap();
         assert_eq!(
             got, original,
             "the merge replayed an intermediate delta the newest one had undone"
@@ -1767,6 +1862,11 @@ mod tests {
             9,
         );
         in_progress.finalized = false;
+        // Skipped is "as in the base", so each carries the base's hash.
+        for entry in &mut in_progress.ranks.get_mut(&0).unwrap().tensors {
+            let base = &manifest.snapshots[0].ranks[&0].tensors;
+            entry.hash_raw = base.iter().find(|t| t.name == entry.name).unwrap().hash_raw.clone();
+        }
         let in_progress_id = in_progress.id;
         manifest.snapshots.push(in_progress);
 
