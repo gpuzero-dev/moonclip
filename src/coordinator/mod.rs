@@ -274,7 +274,20 @@ impl Coordinator {
         // shares one storage root, and ranks 1..N write into directories rank 0
         // created.
         let mut manifest = manifest;
-        if config.rank == 0 && recover_or_reclaim_orphans(storage.as_ref(), &mut manifest) {
+        // A snapshot some rank never finished - the process died between its
+        // ranks - is nobody's to finish now: at startup nothing is being
+        // saved. Left in the manifest it stayed "in progress" for good, and
+        // every merge on its base stood down for it, for the rest of the
+        // run and every run after (GPU-479). Out of the manifest, its files
+        // are an orphan like any other, which the recovery below takes back
+        // if they turn out whole, and removes if not.
+        let abandoned = config.rank == 0 && {
+            let before = manifest.snapshots.len();
+            manifest.snapshots.retain(|s| s.finalized);
+            manifest.snapshots.len() != before
+        };
+        let recovered = config.rank == 0 && recover_or_reclaim_orphans(storage.as_ref(), &mut manifest);
+        if abandoned || recovered {
             // Persist immediately: a recovered checkpoint that only exists in
             // this process's memory would be lost again to the next crash, and
             // would be re-recovered on every startup until one happened not to.

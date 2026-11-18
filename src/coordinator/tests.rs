@@ -1427,6 +1427,33 @@ fn a_pin_survives_reopening_the_store() {
     assert_eq!(reopened.pinned_steps(), vec![7]);
 }
 
+/// A snapshot announced and never finished by a process that died does not
+/// stay "in progress" across a restart, where it held every merge back.
+#[test]
+fn a_snapshot_nobody_finished_is_gone_at_the_next_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let config = || CoordinatorConfig {
+        world_size: 2,
+        rank: 0,
+        compression: CompressionAlgo::Zstd { level: 1 },
+        delta_max_ratio: 0.95,
+        ..Default::default()
+    };
+    {
+        let coord = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+        coord.create_snapshot(5, HashMap::new()).unwrap();
+        let manifest = coord.core.lock_manifest();
+        assert!(manifest.snapshots.iter().any(|s| !s.finalized));
+    }
+    let reopened = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+    assert!(reopened.core.lock_manifest().snapshots.iter().all(|s| s.finalized));
+    // And it is the stored manifest that says so, not only this process's.
+    drop(reopened);
+    let again = Coordinator::new(storage, config()).unwrap();
+    assert!(again.core.lock_manifest().snapshots.is_empty());
+}
+
 /// Snapshots on the rollback interval are meant to outlive the ordinary
 /// retention cap — that is the whole point of keeping them.
 #[test]
