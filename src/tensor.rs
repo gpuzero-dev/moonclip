@@ -588,6 +588,22 @@ fn resolve_base_entry(
     )))
 }
 
+
+/// The compressed bytes of `entry` are the ones it was written with, where
+/// it recorded their hash (cheap with xxHash3).
+fn verify_compressed(entry: &TensorEntry, compressed: &[u8]) -> Result<()> {
+    if let Some(ref expected) = entry.hash_compressed {
+        let actual = hash_hex(compressed);
+        if &actual != expected {
+            return Err(MoonclipError::IntegrityError {
+                expected: expected.clone(),
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Load raw bytes without uncasting.
 fn load_tensor_raw(
     entry: &TensorEntry,
@@ -628,22 +644,17 @@ fn load_tensor_raw(
         }
         TensorStorage::Full => {
             let compressed = extract_compressed(entry, storage, pack)?;
-
-            // Verify compressed integrity (cheap with xxHash3)
-            if let Some(ref expected) = entry.hash_compressed {
-                let actual = hash_hex(&compressed);
-                if &actual != expected {
-                    return Err(MoonclipError::IntegrityError {
-                        expected: expected.clone(),
-                        actual,
-                    });
-                }
-            }
-
+            verify_compressed(entry, &compressed)?;
             compression::decompress(&compressed, compression)
         }
         TensorStorage::DeltaXor => {
             let compressed = extract_compressed(entry, storage, pack)?;
+            // Before the decompression, as a full tensor's are: its frames'
+            // headers say how much to allocate, and a bit flipped in one
+            // asked for terabytes - the process aborted at resume, where an
+            // error would have let the caller fall back to an older step
+            // (GPU-468).
+            verify_compressed(entry, &compressed)?;
             let mut delta_data = compression::decompress(&compressed, compression)?;
             // Each buffer goes as soon as the next one exists: with a thread
             // per core loading at once, every tensor-sized buffer kept alive

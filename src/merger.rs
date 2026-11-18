@@ -447,12 +447,19 @@ fn do_stride_merge(
     // Only deltas against the same base are superseded by it. Deltas against
     // some other base describe a different state, and dropping one would be
     // discarding history rather than folding it.
+    //
+    // Nor is one somebody pinned, or that rollback protection holds: the
+    // fold deletes what it supersedes, and a step kept on purpose was
+    // deleted by the next merge after it (GPU-468). Retention asks the same
+    // list before it evicts.
+    let protected = manifest.protected_snapshot_ids();
     let superseded: Vec<Uuid> = tail
         .iter()
         .filter(|s| {
             s.finalized
                 && s.id != survivor.id
                 && s.base_snapshot_id == survivor.base_snapshot_id
+                && !protected.contains(&s.id)
         })
         .map(|s| s.id)
         .collect();
@@ -631,6 +638,15 @@ pub(crate) fn do_full_merge_within(
         .collect();
 
     if deltas.is_empty() {
+        return Ok(MergeOutcome::NothingToMerge);
+    }
+
+    // A full merge leaves one snapshot, at the newest delta's step, where
+    // the base and every delta were: a step somebody pinned among them
+    // would be gone, which is the one thing a pin is there to prevent
+    // (GPU-468). So nothing is folded while one is pinned; unpinned, the
+    // next notify folds them.
+    if base_snap.pinned || deltas.iter().any(|s| s.pinned) {
         return Ok(MergeOutcome::NothingToMerge);
     }
 
@@ -1323,6 +1339,30 @@ mod tests {
             let pack = snapshot.ranks[&0].pack_file.as_ref().unwrap();
             assert!(storage.exists(pack).unwrap(), "{pack} was deleted by a merge that failed");
         }
+    }
+
+    /// A pin is "keep this step": neither kind of merge deletes it.
+    #[test]
+    fn a_pinned_step_survives_every_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let (mut manifest, _) = delta_run(storage.as_ref(), 2, 20_000, 3);
+        manifest.snapshots[1].pinned = true;
+        let kept = manifest.snapshots[1].id;
+        let count = manifest.snapshots.len();
+        let manifest = Arc::new(Mutex::new(manifest));
+
+        assert_eq!(
+            do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap(),
+            MergeOutcome::NothingToMerge
+        );
+        do_stride_merge(&stride_config(2, 10), &storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
+
+        let m = manifest.lock().unwrap();
+        assert!(m.snapshots.iter().any(|s| s.id == kept), "the pinned step was merged away");
+        assert!(m.snapshots.len() < count, "the deltas nobody pinned were still folded");
+        let pack = m.snapshots.iter().find(|s| s.id == kept).unwrap().ranks[&0].pack_file.clone().unwrap();
+        assert!(storage.exists(&pack).unwrap());
     }
 
     #[test]

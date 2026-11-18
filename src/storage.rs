@@ -94,6 +94,20 @@ pub trait StorageBackend: Send + Sync {
     /// [`list`](Self::list), with each file's size where the listing itself
     /// carries it.
     ///
+    /// Delete, under `prefix`, the files a write left half done and nothing
+    /// will finish: older than `older_than`, so one a rank is writing this
+    /// moment is never among them. Returns the bytes freed.
+    ///
+    /// A write goes to a file of its own name and is renamed when whole, so
+    /// a process killed mid-save leaves that file, which `list` hides and
+    /// therefore nothing ever deleted: on a machine a provider takes back
+    /// during a save, a whole pack each time, for as long as the disk lasts
+    /// (GPU-468). Only a backend that writes that way has any; the others
+    /// have nothing to do.
+    fn sweep_partials(&self, _prefix: &str, _older_than: std::time::Duration) -> Result<u64> {
+        Ok(0)
+    }
+
     /// For the remote sync, which copies several files at once under a cap on
     /// the bytes held in memory (GPU-235) and has to know a file's size before
     /// reading it. A size learned here costs nothing: S3 puts it in the
@@ -131,8 +145,20 @@ impl LocalStorage {
         Ok(LocalStorage { root, page_size })
     }
 
-    fn full_path(&self, rel: &str) -> PathBuf {
-        self.root.join(rel)
+    /// Where `rel` is under the root - and nowhere else. The names come
+    /// from the manifest and from a bucket's listing as well as from this
+    /// code, and joined unchecked an absolute one, or one with `..`, read,
+    /// wrote or deleted outside the store, at a restore or at retention
+    /// (GPU-468).
+    fn full_path(&self, rel: &str) -> Result<PathBuf> {
+        use std::path::Component;
+        let outside = Path::new(rel)
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir));
+        if outside || rel.split(['/', '\\']).any(|part| part == "..") {
+            return Err(MoonclipError::Storage(format!("{rel:?} is not a path inside the store")));
+        }
+        Ok(self.root.join(rel))
     }
 }
 
@@ -385,7 +411,7 @@ impl LocalStorage {
     ) -> Result<()> {
         use std::io::Write;
 
-        let path = self.full_path(rel_path);
+        let path = self.full_path(rel_path)?;
         let new_dirs = match path.parent() {
             Some(parent) => create_dirs_recording_new(parent)?,
             None => Vec::new(),
@@ -465,7 +491,7 @@ impl StorageBackend for LocalStorage {
     }
 
     fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
-        let path = self.full_path(rel_path);
+        let path = self.full_path(rel_path)?;
         if !path.exists() {
             return Err(MoonclipError::NotFound(rel_path.to_string()));
         }
@@ -475,7 +501,7 @@ impl StorageBackend for LocalStorage {
     fn get_range(&self, rel_path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
 
-        let path = self.full_path(rel_path);
+        let path = self.full_path(rel_path)?;
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -484,17 +510,21 @@ impl StorageBackend for LocalStorage {
             Err(e) => return Err(e.into()),
         };
         file.seek(SeekFrom::Start(offset))?;
-        let mut buf = Vec::with_capacity(len);
+        // No more room than the file has left: a length read out of a
+        // damaged pack's descriptor asked for it all up front, and the
+        // allocation failing took the process down at every start (GPU-468).
+        let left = file.metadata()?.len().saturating_sub(offset);
+        let mut buf = Vec::with_capacity(len.min(usize::try_from(left).unwrap_or(usize::MAX)));
         file.take(len as u64).read_to_end(&mut buf)?;
         Ok(buf)
     }
 
     fn exists(&self, rel_path: &str) -> Result<bool> {
-        Ok(self.full_path(rel_path).exists())
+        Ok(self.full_path(rel_path)?.exists())
     }
 
     fn delete(&self, rel_path: &str) -> Result<()> {
-        let path = self.full_path(rel_path);
+        let path = self.full_path(rel_path)?;
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
@@ -502,7 +532,7 @@ impl StorageBackend for LocalStorage {
     }
 
     fn remove_dir(&self, rel_path: &str) -> Result<()> {
-        let path = self.full_path(rel_path);
+        let path = self.full_path(rel_path)?;
         if path.is_dir() {
             // `remove_dir`, never `remove_dir_all`: this only succeeds on an
             // empty directory, so a path derived wrongly can at worst fail. A
@@ -517,8 +547,34 @@ impl StorageBackend for LocalStorage {
         Ok(self.list_sized(prefix)?.into_iter().map(|(key, _)| key).collect())
     }
 
+    fn sweep_partials(&self, prefix: &str, older_than: std::time::Duration) -> Result<u64> {
+        let search_root = self.full_path(prefix)?;
+        if !search_root.exists() {
+            return Ok(0);
+        }
+        let mut freed = 0;
+        for entry in walkdir::WalkDir::new(&search_root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| is_partial(&e.file_name().to_string_lossy()))
+        {
+            let Ok(metadata) = entry.metadata() else { continue };
+            // A file whose age cannot be read is left: it may be being written.
+            let old = metadata
+                .modified()
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age >= older_than);
+            if old && std::fs::remove_file(entry.path()).is_ok() {
+                freed += metadata.len();
+            }
+        }
+        Ok(freed)
+    }
+
     fn list_sized(&self, prefix: &str) -> Result<Vec<(String, Option<u64>)>> {
-        let search_root = self.full_path(prefix);
+        let search_root = self.full_path(prefix)?;
         if !search_root.exists() {
             return Ok(Vec::new());
         }
@@ -575,6 +631,23 @@ mod tests {
         let mut listed = store.list("snapshots").unwrap();
         listed.sort();
         assert_eq!(listed, vec!["snapshots/s1/.tmp-notes.txt", "snapshots/s1/rank_0.pack"]);
+
+        // Nor does a name reach outside the store.
+        for outside in ["../x", "snapshots/../../x", "/etc/passwd", "a\\..\\..\\x"] {
+            assert!(store.get(outside).is_err(), "{outside} was read");
+            assert!(store.put(outside, b"x").is_err(), "{outside} was written");
+            assert!(store.delete(outside).is_err(), "{outside} was deleted");
+        }
+
+        // And the sweep takes what a killed write left, once it is old
+        // enough not to be one in progress - and nothing else.
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(store.sweep_partials("snapshots", hour).unwrap(), 0);
+        assert!(partial.exists());
+        let freed = store.sweep_partials("snapshots", std::time::Duration::ZERO).unwrap();
+        assert_eq!(freed, (b"half".len() + b"left by a crash".len()) as u64);
+        assert!(!partial.exists());
+        assert_eq!(store.list("snapshots").unwrap(), listed);
     }
 
     /// Listed keys must be usable as keys — by `get` here, and by whatever

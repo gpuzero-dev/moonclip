@@ -13,6 +13,10 @@
 
 use super::*;
 
+/// How old a half-written file is before startup takes it for abandoned: a
+/// save is minutes, and no rank is an hour into writing one file.
+const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 fn rebuild_from_packs(
     storage: &dyn StorageBackend,
     id: &str,
@@ -135,7 +139,18 @@ fn snapshot_data_is_intact(storage: &dyn StorageBackend, snapshot: &Snapshot) ->
 ///
 /// Failures are logged and swallowed: this is housekeeping and must never stop
 /// a training run from starting. Returns true when the manifest changed.
+///
+/// Called on rank 0 at startup, it also sweeps the files a killed write left
+/// under `snapshots/` ([`StorageBackend::sweep_partials`]).
 pub(super) fn recover_or_reclaim_orphans(storage: &dyn StorageBackend, manifest: &mut Manifest) -> bool {
+    // First, what a write killed half way left behind (GPU-468). Older than
+    // an hour only: another rank sharing this root may be writing one now.
+    match storage.sweep_partials("snapshots", STALE_PARTIAL) {
+        Ok(0) => {}
+        Ok(freed) => eprintln!("[Moonclip] Removed {freed} bytes of writes that were never finished"),
+        Err(e) => eprintln!("[Moonclip] Could not look for unfinished writes: {e}"),
+    }
+
     let known: std::collections::HashSet<String> = manifest
         .snapshots
         .iter()
