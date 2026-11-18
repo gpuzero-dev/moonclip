@@ -447,31 +447,33 @@ impl Drop for RemoteSyncer {
 
 /// Delete, on the remote, what has already been deleted locally.
 ///
-/// Failures are logged and dropped rather than returned. A delete that does
-/// not land leaves an object nobody references — it costs storage, and the
-/// next pass will not retry it, which is the honest trade: a sync that
-/// *failed to upload* is a checkpoint at risk and must be reported, while a
-/// sync that failed to tidy up is a bill. Reporting them the same way would
-/// teach callers to ignore both.
+/// Failures are logged rather than returned: a sync that *failed to upload*
+/// is a checkpoint at risk and must be reported, while a sync that failed to
+/// tidy up is a bill, and reporting them the same way would teach callers to
+/// ignore both. But they are not dropped (GPU-477): the keys go back to
+/// wait, and the next pass asks again. Dropped, one bad minute of the
+/// remote's left every object it was asked to delete in the bucket for as
+/// long as the bucket, with nothing that would ever name them again.
 fn apply_deletes(remote: &Arc<dyn StorageBackend>, deletes: &Arc<PendingDeletes>) {
-    delete_all(remote, deletes.drain());
+    deletes.restore(delete_all(remote, deletes.drain()));
 }
 
-/// Delete `keys` from the remote, several at once.
-fn delete_all(remote: &Arc<dyn StorageBackend>, keys: Vec<String>) {
+/// Delete `keys` from the remote, several at once; the ones that could not
+/// be deleted.
+fn delete_all(remote: &Arc<dyn StorageBackend>, keys: Vec<String>) -> Vec<String> {
     if keys.is_empty() {
-        return;
+        return Vec::new();
     }
     // Several at once, as the copies go (GPU-235): one at a time they were
     // what was left of a close once the copies overlapped, 377 requests of
     // 528 on the bench, a delta per step being a delete per step. A delete
     // holds no bytes, so no budget.
     let next = AtomicUsize::new(0);
-    let failures = AtomicUsize::new(0);
+    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let work = || {
         while let Some(key) = keys.get(next.fetch_add(1, Ordering::Relaxed)) {
             if remote.delete(key).is_err() {
-                failures.fetch_add(1, Ordering::Relaxed);
+                failures.lock().unwrap().push(key.clone());
             }
         }
     };
@@ -485,14 +487,15 @@ fn delete_all(remote: &Arc<dyn StorageBackend>, keys: Vec<String>) {
             }
         });
     }
-    let failed = failures.into_inner();
-    if failed > 0 {
+    let failed = failures.into_inner().unwrap();
+    if !failed.is_empty() {
         eprintln!(
-            "[Moonclip sync] {failed} of {} deleted checkpoints could not be removed \
-             from the remote; they are unreferenced but still billed",
+            "[Moonclip sync] {} of {} deleted checkpoints could not be removed from the remote;              they are asked for again at the next sync",
+            failed.len(),
             keys.len()
         );
     }
+    failed
 }
 
 /// The data files of `snapshot`: its packs, and any tensor kept in a file of
@@ -656,7 +659,7 @@ fn put_up(
     let (waiting, gone): (Vec<String>, Vec<String>) =
         deletes.drain().into_iter().partition(|key| named.contains(key));
     deletes.restore(waiting);
-    delete_all(remote, gone);
+    deletes.restore(delete_all(remote, gone));
     Ok(Some(kept.snapshots.iter().map(|s| s.step).collect()))
 }
 
@@ -1980,6 +1983,57 @@ mod tests {
             assert!(!dst.exists(&format!("snapshots/s{i}/rank_0.pack")).unwrap());
         }
         assert!(deletes.keys.lock().unwrap().is_empty());
+    }
+
+    /// A delete the remote refused is asked for again at the next pass: once
+    /// dropped, nothing ever named the object again (GPU-477).
+    #[test]
+    fn a_delete_the_remote_refused_waits_for_the_next_pass() {
+        struct Flaky {
+            inner: Arc<dyn StorageBackend>,
+            down: std::sync::atomic::AtomicBool,
+        }
+        impl StorageBackend for Flaky {
+            fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+                self.inner.put(rel_path, data)
+            }
+            fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+                self.inner.get(rel_path)
+            }
+            fn get_range(&self, rel_path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+                self.inner.get_range(rel_path, offset, len)
+            }
+            fn exists(&self, rel_path: &str) -> Result<bool> {
+                self.inner.exists(rel_path)
+            }
+            fn delete(&self, rel_path: &str) -> Result<()> {
+                if self.down.load(Ordering::SeqCst) {
+                    return Err(crate::error::MoonclipError::Storage("503".into()));
+                }
+                self.inner.delete(rel_path)
+            }
+            fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.inner.list(prefix)
+            }
+        }
+
+        let (_s, _d, _src, dst) = two_stores();
+        let flaky = Arc::new(Flaky { inner: dst.clone(), down: std::sync::atomic::AtomicBool::new(true) });
+        let remote: Arc<dyn StorageBackend> = flaky.clone();
+        let deletes = Arc::new(PendingDeletes::default());
+        for i in 0..5 {
+            let key = format!("snapshots/s{i}/rank_0.pack");
+            dst.put(&key, b"old").unwrap();
+            deletes.push(key);
+        }
+
+        apply_deletes(&remote, &deletes);
+        assert_eq!(deletes.keys.lock().unwrap().len(), 5);
+
+        flaky.down.store(false, Ordering::SeqCst);
+        apply_deletes(&remote, &deletes);
+        assert!(deletes.keys.lock().unwrap().is_empty());
+        assert!(!dst.exists("snapshots/s0/rank_0.pack").unwrap());
     }
 
     /// Only `debug` turns the quiet syncs' lines back on; anything else, or
