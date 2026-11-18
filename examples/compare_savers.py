@@ -14,8 +14,8 @@ would.
 
 "Blocked" is what the training loop waits for: the whole save for torch.save
 and DCP, the copy of the tensors for Moonclip, whose hashing, delta and write
-run in the background (its `flush()` at the end is timed apart). "Written per
-save" is the size of one checkpoint for torch.save and DCP, and for Moonclip
+run in the background: what is left of it after the last save, which only
+`flush()` waits for, is timed apart (GPU-413). "Written per save" is the size of one checkpoint for torch.save and DCP, and for Moonclip
 its store's size at the end divided by the saves: the first is a full
 snapshot and the rest are deltas against it.
 
@@ -120,14 +120,14 @@ def main():
         f"{parameters / 1e6:.0f}M parameters + AdamW, fp32, {args.device} ({machine}, {os.cpu_count()} cores), "
         f"torch {torch.__version__}; a save every {args.every} steps, {args.steps // args.every} saves\n"
     )
-    print("| saver | blocked per save (median) | flush at the end | written per save |")
+    print("| saver | blocked per save (median) | background write, after the last save | written per save |")
     print("|---|---|---|---|")
     for saver, blocked, flushed, size in rows:
         median = sorted(blocked)[len(blocked) // 2]
         print(
             f"| {saver} | {median * 1000:,.0f} ms | {flushed * 1000:,.0f} ms | {size / 2**20:,.0f} MiB |"
             if saver == "moonclip"
-            else f"| {saver} | {median * 1000:,.0f} ms | - | {size / 2**20:,.0f} MiB |"
+            else f"| {saver} | {median * 1000:,.0f} ms | none | {size / 2**20:,.0f} MiB |"
         )
 
 
