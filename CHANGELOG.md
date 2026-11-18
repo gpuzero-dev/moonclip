@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.7 — 2026-11-18
+
+### Changed
+
+- **The README says what an outside reader got wrong (GPU-413).** The
+  benchmark table names its second column for what it is, the background
+  write left after the last save, which does not stop training, and
+  `examples/compare_savers.py` prints the same columns; one line says how
+  Moonclip is used with Lightning, Accelerate and the Hugging Face Trainer;
+  versions and platforms of past releases are gone. No change to the code.
+
 ## 0.3.6 — 2026-11-16
 
 ### Fixed
