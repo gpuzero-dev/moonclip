@@ -204,6 +204,19 @@ impl RetentionPolicy {
         self.max_total_snapshots
             .unwrap_or(self.max_full_snapshots * (1 + self.max_deltas_per_full))
     }
+
+    /// Whether any save under this policy can be a delta.
+    ///
+    /// Not under a full every step, nor with no deltas allowed per full, nor
+    /// with a cap of one snapshot: [`Manifest::should_force_full`] answers yes
+    /// to every later step in each case. A base kept in memory for a delta
+    /// that can never come is a copy of the whole state held for nothing,
+    /// which is what a run saving only fulls paid after every save (GPU-443).
+    pub fn allows_deltas(&self) -> bool {
+        self.full_snapshot_every_steps > 1
+            && self.max_deltas_per_full > 0
+            && self.effective_total_cap() > 1
+    }
 }
 
 // ─── Manifest v2 ────────────────────────────────────────────────────

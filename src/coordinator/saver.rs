@@ -36,6 +36,10 @@ pub(super) struct AsyncSaver {
     /// drain. Written by the caller's thread in `submit`, read by that same
     /// thread once `save` returns — see [`Coordinator::last_queue_wait`].
     pub(super) last_wait: AtomicU64,
+    /// How long [`AsyncSaver::wait_for_slot`] waited before the shadow copy,
+    /// carried into the next `submit`'s `last_wait`: from outside it is the
+    /// same backpressure, only paid before the copy instead of after it.
+    waited_before_copy: AtomicU64,
 }
 
 impl AsyncSaver {
@@ -90,7 +94,42 @@ impl AsyncSaver {
             shared,
             handle: Some(handle),
             last_wait: AtomicU64::new(0),
+            waited_before_copy: AtomicU64::new(0),
         }
+    }
+
+    /// Wait until the previous save has drained, before the caller takes the
+    /// shadow copy of the next one (GPU-443).
+    ///
+    /// The copy used to come first and the wait after, in `submit`: the next
+    /// state was copied while the previous one was still being compressed
+    /// and written, so two shadow copies were alive at once, and with the
+    /// base kept for deltas three copies of the state besides the caller's
+    /// own. Waiting first holds that to one. What it costs is overlap: the
+    /// copy no longer runs during the tail of the previous write, so under
+    /// backpressure a save returns later by up to the copy's duration. A
+    /// save that finds the writer idle loses nothing.
+    ///
+    /// Advisory, not a reservation: `submit` still claims the slot under its
+    /// own lock, which is what keeps the queue bound to one job.
+    pub(super) fn wait_for_slot(&self) {
+        // The same rule as `submit`: a wait on this condvar from a pool
+        // thread can be a wait on work only that thread would do.
+        debug_assert!(
+            rayon::current_thread_index().is_none(),
+            "AsyncSaver::wait_for_slot blocked on a Moonclip pool thread"
+        );
+        let (lock, cvar) = &*self.shared;
+        let started = Instant::now();
+        let mut state = lock.lock().unwrap();
+        while state.busy {
+            state = cvar.wait(state).unwrap();
+        }
+        drop(state);
+        // The wait of this save, not a sum: `last_queue_wait` describes the
+        // last call, and a caller that never reads it must not see a total.
+        self.waited_before_copy
+            .store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// Wait until no save is in flight. Does not consume errors.
@@ -152,7 +191,8 @@ impl AsyncSaver {
         // apart from the outside. Kept for the caller as well as logged: a
         // number only `MOONCLIP_PROFILE=1` will show is a number nobody has
         // when the question comes up, which is on a rented machine mid-run.
-        let waited = queued.elapsed();
+        let waited = queued.elapsed()
+            + Duration::from_nanos(self.waited_before_copy.swap(0, Ordering::Relaxed));
         self.last_wait
             .store(waited.as_nanos() as u64, Ordering::Relaxed);
         // Surface a failure from the previous save before starting another,

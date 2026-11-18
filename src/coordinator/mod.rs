@@ -77,6 +77,10 @@ pub struct CoordinatorConfig {
     /// Applied per tensor: a tensor `save_dtype` casts is not retained,
     /// because a later delta is computed against the post-cast bytes on disk
     /// and those are not what arrives here. The rest of the snapshot still is.
+    ///
+    /// Nothing is kept when the retention policy rules every delta out (see
+    /// [`RetentionPolicy::allows_deltas`]), and the base of the last full is
+    /// dropped as soon as a new full begins, not when it ends (GPU-443).
     pub keep_base_in_memory: bool,
 }
 
@@ -108,6 +112,85 @@ struct SnapshotContext {
     step: u64,
     created_at: DateTime<Utc>,
     metadata: HashMap<String, String>,
+}
+
+/// Raw bytes of tensors compressed together before their blobs are written
+/// and freed (GPU-443).
+///
+/// It bounds what a save holds beyond the shadow copy: a batch's compressed
+/// blobs, and the working buffers of the tensors in flight - on the delta
+/// path a tensor's XOR, its shuffled planes and its compressed form, several
+/// times the tensor. Measured on 576 MB of float32 state in 16 MB tensors on
+/// 16 cores, the peak over the state went from 1.5x to 1.1x for a full save
+/// and from 2.8x to 2.2x for a delta with its base kept, between 256 MiB and
+/// 64 MiB, with no difference in save time that stood out of the run-to-run
+/// spread (8 to 18 s for eight saves of the same build): parallelism comes
+/// from inside each tensor as well, compressed in 4 MiB frames (see
+/// `crate::compression`). A tensor larger than the budget is a batch by
+/// itself. A load reads and decompresses in batches of the same size.
+const SAVE_BATCH_BYTES: usize = 64 << 20;
+
+/// Compressed bytes up to which a load reads a pack whole rather than tensor
+/// by tensor (GPU-443). Below it the single read is cheaper than many small
+/// ones and the copy it holds is small; above it the copy is what matters,
+/// since it sits beside the whole decompressed snapshot until the load ends.
+const WHOLE_PACK_READ_LIMIT: u64 = 64 << 20;
+
+/// Split `unique` (indices into `tensors`) into consecutive batches of at most
+/// `budget` raw bytes each, in order, never empty. Consecutive and in order
+/// because the blobs land in the pack in the order the tensors come.
+fn save_batches(tensors: &[TensorData], unique: &[usize], budget: usize) -> Vec<Vec<usize>> {
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut bytes = 0usize;
+    for &i in unique {
+        let len = tensors[i].data.len();
+        if !current.is_empty() && bytes + len > budget {
+            batches.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+        current.push(i);
+        bytes += len;
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Whether a tensor's incoming bytes can serve as the in-memory base for a
+/// later delta.
+///
+/// Decided per tensor, because `save_dtype` is. What a later delta is
+/// computed against is the bytes on disk; for a tensor that was cast,
+/// those are not the bytes that arrived here, and retaining them would
+/// XOR the next delta against the wrong base. So the test is
+/// `original_dtype.is_none()`, which is set by
+/// [`tensor::process_tensor`] exactly when the stored bytes and the
+/// incoming bytes are the same bytes.
+///
+/// The damage is not silent corruption, and it is worth being accurate
+/// about which it is. A wrong base is caught three times over: a cast
+/// that changes the width fails the length check in
+/// [`crate::delta::compute_delta`], a cast that keeps it produces a
+/// high-entropy XOR that [`crate::delta::pays_off`] rejects, and
+/// anything that survives both fails the hash the load path verifies
+/// after applying the delta. What it costs is the optimization it was
+/// meant to provide — a full save where a delta belonged — or, in the
+/// worst case, a checkpoint that refuses to load at resume. Two of those
+/// three guards are heuristics about size, which is not what a
+/// correctness argument should rest on; this is.
+///
+/// Under the old all-or-nothing rule a single cast turned the whole
+/// optimization off. Per tensor, the ordinary configuration — moments to
+/// bf16, weights untouched — keeps the weights in memory, which is the
+/// third of the state where the delta actually pays.
+///
+/// A partial map needs no special handling downstream: `BaseCache` looks
+/// each tensor up by name and falls back to storage on a miss, so a
+/// tensor left out here simply takes the path it took before.
+fn retainable(entry: &TensorEntry) -> bool {
+    entry.storage == TensorStorage::Full && entry.original_dtype.is_none()
 }
 
 /// Rebuild a snapshot from the descriptions its own packs carry.
@@ -344,6 +427,25 @@ impl Coordinator {
             s.flush()?;
         }
         self.core.check_background_threads()
+    }
+
+    /// Wait for the previous background save to drain. Call it before taking
+    /// the copy of the tensors that the next [`save`](Self::save) will be
+    /// handed, and only one copy of the state is ever in flight.
+    ///
+    /// `save` waits on its own, but by then its argument already exists: a
+    /// caller that copies its live state and then calls `save` while a save
+    /// is still being written holds two copies of the state besides its own,
+    /// which on a 1B-parameter run with its Adam state was the difference
+    /// between fitting in memory and being killed (GPU-443). The Python
+    /// binding calls this before its shadow copy. The time spent here is
+    /// reported by [`last_queue_wait`](Self::last_queue_wait) with the next
+    /// save's, since it is the same backpressure. Never blocks with
+    /// `async_save` off: there is nothing in flight.
+    pub fn wait_for_previous_save(&self) {
+        if let Some(ref s) = self.saver {
+            s.wait_for_slot();
+        }
     }
 
     fn wait_idle(&self) {
@@ -1020,11 +1122,17 @@ impl Core {
             ))
         })?;
 
-        // Pre-load pack file if present (single read for all tensors)
-        let pack_data = if let Some(ref pack_file) = rank_entry.pack_file {
-            Some(self.storage.get(pack_file)?)
-        } else {
-            None
+        // A small pack is read in one go and sliced; a large one tensor by
+        // tensor, each a ranged read. Reading a large pack whole held the
+        // entire compressed snapshot, and for a delta its base's as well,
+        // beside every tensor decompressed out of them: two to three copies
+        // of the state for a load that hands back one (GPU-443). Ranged, what
+        // is held besides the result is one compressed tensor per thread.
+        let pack_data = match rank_entry.pack_file {
+            Some(ref pack_file) if rank_entry.total_compressed <= WHOLE_PACK_READ_LIMIT => {
+                Some(self.storage.get(pack_file)?)
+            }
+            _ => None,
         };
 
         // Prefetch the base snapshot's entries + pack once, shared across
@@ -1047,10 +1155,12 @@ impl Core {
                 match base_snap {
                     Some(bs) => match bs.ranks.get(&self.config.rank) {
                         Some(re) => {
+                            // The same rule as the snapshot's own pack.
                             let pack = match re.pack_file {
-                                Some(ref p) => {
+                                Some(ref p) if re.total_compressed <= WHOLE_PACK_READ_LIMIT => {
                                     tensor::OwnedPack::Whole(Arc::new(self.storage.get(p)?))
                                 }
+                                Some(ref p) => tensor::OwnedPack::Ranged(p.as_str().into()),
                                 None => tensor::OwnedPack::PerFile,
                             };
                             let entries = re
@@ -1085,27 +1195,47 @@ impl Core {
             self.find_base_tensor_entry_with_pack(base_id, tensor_name, true)
         };
 
-        let pairs: Result<Vec<(String, Vec<u8>)>> = rank_entry
+        // In batches of at most `SAVE_BATCH_BYTES` raw, for the reason the
+        // save is: every tensor in flight has its compressed bytes and, for a
+        // delta, its base and its delta beside it, and with all of them in
+        // flight at once that was a thread per core times several tensors -
+        // more than the snapshot itself on a many-core node (GPU-443). A
+        // large tensor still decompresses in parallel, frame by frame.
+        let stored: Vec<&TensorEntry> = rank_entry
             .tensors
-            .par_iter()
+            .iter()
             .filter(|entry| entry.storage != TensorStorage::Alias)
-            .map(|entry| {
-                tensor::load_tensor(
-                    entry,
-                    snap.base_snapshot_id,
-                    self.storage.as_ref(),
-                    &snap.compression,
-                    match pack_data {
-                        Some(ref bytes) => tensor::PackSource::Whole(bytes),
-                        None => tensor::PackSource::PerFile,
-                    },
-                    &resolver,
-                )
-                .map(|data| (entry.name.clone(), data))
-            })
             .collect();
-
-        let mut out: HashMap<String, Vec<u8>> = pairs?.into_iter().collect();
+        let mut out: HashMap<String, Vec<u8>> = HashMap::with_capacity(rank_entry.tensors.len());
+        let mut start = 0;
+        while start < stored.len() {
+            let mut end = start + 1;
+            let mut bytes = stored[start].raw_size;
+            while end < stored.len() && bytes + stored[end].raw_size <= SAVE_BATCH_BYTES as u64 {
+                bytes += stored[end].raw_size;
+                end += 1;
+            }
+            let pairs: Result<Vec<(String, Vec<u8>)>> = stored[start..end]
+                .par_iter()
+                .map(|entry| {
+                    tensor::load_tensor(
+                        entry,
+                        snap.base_snapshot_id,
+                        self.storage.as_ref(),
+                        &snap.compression,
+                        match (&pack_data, &rank_entry.pack_file) {
+                            (Some(bytes), _) => tensor::PackSource::Whole(bytes),
+                            (None, Some(path)) => tensor::PackSource::Ranged(path),
+                            (None, None) => tensor::PackSource::PerFile,
+                        },
+                        &resolver,
+                    )
+                    .map(|data| (entry.name.clone(), data))
+                })
+                .collect();
+            out.extend(pairs?);
+            start = end;
+        }
 
         // Second pass: aliases share bytes with a tensor already loaded above.
         for entry in &rank_entry.tensors {
@@ -1598,152 +1728,183 @@ impl Core {
         // ── 1. Build lazy base cache (no upfront disk read) ──────────
         let base_cache = self.build_base_cache(base_snap);
 
+        // A full save diffs against nothing, so the base kept for the last
+        // one is dead weight from here on: this save is about to become the
+        // base. Letting it live until the new one replaced it, at the end,
+        // held two whole copies of the state at once (GPU-443). If this save
+        // fails, the next delta reads its base off storage, which is the same
+        // bytes, only slower.
+        if base_snap.is_none() {
+            *self.retained_base.lock().unwrap() = None;
+        }
+        // Kept only when a delta can ever follow: under a full at every step
+        // the copy would be held after every save and read by nothing.
+        let retain = base_snap.is_none()
+            && self.config.keep_base_in_memory
+            && self.lock_manifest().retention.allows_deltas();
+
+        let mut tensors = tensors;
         self.check_dtype_patterns(&tensors);
 
-        // ── 2. Deduplicate, then process the survivors in parallel ───
+        // ── 2. Deduplicate ──────────────────────────────────────────
         // Tied embeddings and repeated buffers hold identical bytes under
         // several names; store them once and point the rest at the copy.
         let dedup = tensor::dedup_plan(&tensors);
-        let unique: Vec<&TensorData> = tensors
-            .iter()
-            .zip(&dedup)
-            .filter(|(_, alias)| alias.is_none())
-            .map(|(t, _)| t)
-            .collect();
-
-        let mut processed = tensor::process_tensors_parallel(
-            &unique,
-            base_cache.as_ref(),
-            &self.config.compression,
-            self.config.delta_max_ratio,
-            &self.config.save_dtype,
-        )?;
-        drop(unique);
-
-        // Alias entries inherit dtype/cast/hash from the stored tensor, so
-        // they must be built after processing. They carry no data, so they
-        // do not affect the pack offsets assigned below.
-        let stored: HashMap<&str, &TensorEntry> = processed
-            .iter()
-            .map(|pt| (pt.entry.name.as_str(), &pt.entry))
-            .collect();
-        let alias_entries: Vec<TensorEntry> = tensors
-            .iter()
-            .zip(&dedup)
-            .filter_map(|(t, alias)| {
-                let target = stored.get(alias.as_deref()?)?;
-                Some(tensor::make_alias_entry(t, target))
-            })
-            .collect();
-        drop(stored);
-        processed.extend(alias_entries.into_iter().map(|entry| tensor::ProcessedTensor {
-            entry,
-            write_data: None,
-        }));
-        // A full snapshot's bytes are exactly what the next delta needs as a
-        // base. Retaining them here moves buffers that were about to be
-        // freed; on a delta snapshot they are not the base, so they go.
-        if base_snap.is_none() {
-            self.retain_base(snap_id, tensors, &processed);
-        } else {
-            drop(tensors); // raw tensor data no longer needed
-        }
-
-        // ── 3. Assign pack offsets and write all parts in one file ──
-        // Offsets start after the header, not at zero: the pack carries its own
-        // description (see `crate::pack`). Every reader takes these offsets
-        // from the manifest rather than assuming the first tensor sits at the
-        // start of the file, so the shift is invisible to them.
-        let mut offset = pack::HEADER_LEN;
-        for pt in &mut processed {
-            if let Some(ref data) = pt.write_data {
-                pt.entry.offset = offset;
-                offset += data.len() as u64;
+        // An alias's bytes are never read again: its entry takes everything
+        // from the tensor that is stored. Freed now rather than at the end.
+        for (t, alias) in tensors.iter_mut().zip(&dedup) {
+            if alias.is_some() {
+                t.data = Vec::new();
             }
         }
-        let blobs_end = offset;
+        let unique: Vec<usize> = (0..tensors.len()).filter(|&i| dedup[i].is_none()).collect();
 
-        // ── 4. Build the rank entry, which the descriptor carries ───
+        // ── 3. Process in bounded batches, writing each as it is done ─
         //
-        // Always a pack, even when this rank has no bytes to write.
+        // The pack is header, blobs, descriptor, and the blobs used to be
+        // produced all at once and written all at once: the whole state
+        // compressed, held beside the whole state raw. Weights and Adam
+        // moments barely compress, so that was a second copy of the state on
+        // top of the shadow copy, and on a 1B-parameter run it is what the
+        // kernel killed the node for (GPU-443). Now a batch of tensors is
+        // compressed in parallel, its blobs are appended to the file and
+        // freed, and so is each tensor's raw copy unless it is being kept as
+        // the next base. What is in memory beyond the shadow copy is one
+        // batch's blobs. The bytes on disk are the same, in the same order.
         //
-        // A step where nothing changed is the ordinary case in fine-tuning:
-        // whole stretches of the model do not move, every tensor comes out
-        // `Skipped`, and there is not a single blob to store. Skipping the
-        // pack then saved one small file and cost the checkpoint its
-        // description — `recover_or_reclaim_orphans` rebuilds a snapshot the
-        // manifest lost from the descriptors in its packs, so a snapshot with
-        // no pack is not merely unrecovered, there is nothing for recovery to
-        // read. A process killed between the save and the manifest write left
-        // it unrecoverable, and `crate::pack` claimed that state was
-        // impossible.
-        //
-        // What it costs: a header plus a JSON descriptor per rank per empty
-        // snapshot, a few hundred bytes, against a checkpoint that can be
-        // brought back.
+        // The header goes in first as zeros and is filled in at the end,
+        // when where the descriptor starts and how long it is are known.
         let pack_file = format!("{}/rank_{}.pack", snap_dir, self.config.rank);
+        let batches = save_batches(&tensors, &unique, SAVE_BATCH_BYTES);
+        let mut retained: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut rank_entry: Option<RankEntry> = None;
 
-        let mut entries = Vec::new();
-        let mut total_compressed = 0u64;
-        let mut total_raw = 0u64;
-        let mut skipped = 0usize;
-        let mut delta = 0usize;
-        let mut full = 0usize;
+        self.storage.put_streamed(&pack_file, &mut |sink| {
+            sink.append(&[0u8; pack::HEADER_LEN as usize])?;
+            let mut offset = pack::HEADER_LEN;
+            let mut processed: Vec<tensor::ProcessedTensor> = Vec::with_capacity(tensors.len());
 
-        // By reference, and cloning only the entries: the descriptor has to be
-        // built before the pack is written, and `processed` still owns the
-        // compressed blobs. Consuming it here would mean copying those blobs
-        // to write them — gigabytes, on the path this whole session was spent
-        // making cheaper.
-        for pt in &processed {
-            total_compressed += pt.entry.compressed_size;
-            total_raw += pt.entry.raw_size;
-            match pt.entry.storage {
-                // Aliases write no bytes, same as a skipped tensor.
-                TensorStorage::Skipped | TensorStorage::Alias => skipped += 1,
-                TensorStorage::DeltaXor => delta += 1,
-                TensorStorage::Full => full += 1,
+            for batch in &batches {
+                let refs: Vec<&TensorData> = batch.iter().map(|&i| &tensors[i]).collect();
+                let results = tensor::process_tensors_parallel(
+                    &refs,
+                    base_cache.as_ref(),
+                    &self.config.compression,
+                    self.config.delta_max_ratio,
+                    &self.config.save_dtype,
+                )?;
+                drop(refs);
+
+                for (&i, mut pt) in batch.iter().zip(results) {
+                    if let Some(blob) = pt.write_data.take() {
+                        pt.entry.offset = offset;
+                        offset += blob.len() as u64;
+                        crate::profile::time(crate::profile::Phase::PackWrite, || {
+                            sink.append(&blob)
+                        })?;
+                    }
+                    // A full snapshot's bytes are exactly what the next delta
+                    // needs as a base, so those are moved, not freed; see
+                    // `retainable` for which ones qualify.
+                    let bytes = std::mem::take(&mut tensors[i].data);
+                    if retain && retainable(&pt.entry) {
+                        retained.insert(pt.entry.name.clone(), bytes);
+                    }
+                    processed.push(pt);
+                }
             }
-            entries.push(pt.entry.clone());
-        }
+            let blobs_end = offset;
 
-        let rank_entry = RankEntry {
-            rank: self.config.rank,
-            tensors: entries,
-            pack_file: Some(pack_file),
-            total_compressed,
-            total_raw,
-            skipped_count: skipped,
-            delta_count: delta,
-            full_count: full,
-        };
+            // Alias entries inherit dtype/cast/hash from the stored tensor,
+            // so they are built after processing. They carry no data and take
+            // no room in the pack.
+            let stored: HashMap<&str, &TensorEntry> = processed
+                .iter()
+                .map(|pt| (pt.entry.name.as_str(), &pt.entry))
+                .collect();
+            let alias_entries: Vec<TensorEntry> = tensors
+                .iter()
+                .zip(&dedup)
+                .filter_map(|(t, alias)| {
+                    let target = stored.get(alias.as_deref()?)?;
+                    Some(tensor::make_alias_entry(t, target))
+                })
+                .collect();
+            drop(stored);
 
-        // ── 5. Write header + blobs + descriptor, in one object ─────
-        let pack_filename = rank_entry.pack_file.as_ref().expect("set just above");
-        let descriptor = pack::PackDescriptor {
-            snapshot_id: snap_id,
-            step: context.step,
-            created_at: context.created_at,
-            base_snapshot_id: base_snap.as_ref().map(|s| s.id),
-            metadata: context.metadata.clone(),
-            compression: self.config.compression.clone(),
-            world_size: self.config.world_size,
-            rank: rank_entry.clone(),
-        };
-        let encoded = serde_json::to_vec(&descriptor)
-            .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
-        let header = pack::encode_header(blobs_end, encoded.len() as u64);
+            // ── 4. Build the rank entry, which the descriptor carries ───
+            //
+            // Always a pack, even when this rank has no bytes to write.
+            //
+            // A step where nothing changed is the ordinary case in fine-tuning:
+            // whole stretches of the model do not move, every tensor comes out
+            // `Skipped`, and there is not a single blob to store. Skipping the
+            // pack then saved one small file and cost the checkpoint its
+            // description — `recover_or_reclaim_orphans` rebuilds a snapshot the
+            // manifest lost from the descriptors in its packs, so a snapshot with
+            // no pack is not merely unrecovered, there is nothing for recovery to
+            // read. A process killed between the save and the manifest write left
+            // it unrecoverable, and `crate::pack` claimed that state was
+            // impossible.
+            //
+            // What it costs: a header plus a JSON descriptor per rank per empty
+            // snapshot, a few hundred bytes, against a checkpoint that can be
+            // brought back.
+            let mut entries: Vec<TensorEntry> = processed.into_iter().map(|pt| pt.entry).collect();
+            entries.extend(alias_entries);
 
-        let mut parts: Vec<&[u8]> = Vec::with_capacity(processed.len() + 2);
-        parts.push(&header);
-        parts.extend(processed.iter().filter_map(|pt| pt.write_data.as_deref()));
-        parts.push(&encoded);
+            let mut total_compressed = 0u64;
+            let mut total_raw = 0u64;
+            let mut skipped = 0usize;
+            let mut delta = 0usize;
+            let mut full = 0usize;
+            for entry in &entries {
+                total_compressed += entry.compressed_size;
+                total_raw += entry.raw_size;
+                match entry.storage {
+                    // Aliases write no bytes, same as a skipped tensor.
+                    TensorStorage::Skipped | TensorStorage::Alias => skipped += 1,
+                    TensorStorage::DeltaXor => delta += 1,
+                    TensorStorage::Full => full += 1,
+                }
+            }
 
-        crate::profile::time(crate::profile::Phase::PackWrite, || {
-            self.storage.put_parts(pack_filename, &parts)
+            let entry = RankEntry {
+                rank: self.config.rank,
+                tensors: entries,
+                pack_file: Some(pack_file.clone()),
+                total_compressed,
+                total_raw,
+                skipped_count: skipped,
+                delta_count: delta,
+                full_count: full,
+            };
+
+            // ── 5. Descriptor after the blobs, then the header ──────────
+            let descriptor = pack::PackDescriptor {
+                snapshot_id: snap_id,
+                step: context.step,
+                created_at: context.created_at,
+                base_snapshot_id: base_snap.as_ref().map(|s| s.id),
+                metadata: context.metadata.clone(),
+                compression: self.config.compression.clone(),
+                world_size: self.config.world_size,
+                rank: entry.clone(),
+            };
+            let encoded = serde_json::to_vec(&descriptor)
+                .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
+            sink.append(&encoded)?;
+            sink.overwrite(0, &pack::encode_header(blobs_end, encoded.len() as u64))?;
+            rank_entry = Some(entry);
+            Ok(())
         })?;
 
-        Ok(rank_entry)
+        if retain {
+            self.retain_base(snap_id, retained);
+        }
+        drop(tensors);
+
+        Ok(rank_entry.expect("set by the pack write, which succeeded"))
     }
 
     /// Build a lazy BaseCache referring to the base snapshot.
@@ -1778,12 +1939,6 @@ impl Core {
         })
     }
 
-    /// Keep this snapshot's bytes as the base for the next delta.
-    ///
-    /// Called only for full snapshots, and it *moves* the incoming data —
-    /// these are the buffers that would otherwise be dropped at the end of
-    /// the save, so retaining them allocates nothing.
-    ///
     /// Report `save_dtype` patterns that match none of this rank's tensors.
     ///
     /// A pattern that fires on nothing is this feature's quiet failure:
@@ -1815,63 +1970,16 @@ impl Core {
         );
     }
 
-    /// Decided per tensor, because `save_dtype` is. What a later delta is
-    /// computed against is the bytes on disk; for a tensor that was cast,
-    /// those are not the bytes that arrived here, and retaining them would
-    /// XOR the next delta against the wrong base. So the test is
-    /// `original_dtype.is_none()`, which is set by
-    /// [`tensor::process_tensor`] exactly when the stored bytes and the
-    /// incoming bytes are the same bytes.
+    /// Keep this snapshot's bytes as the base for the next delta.
     ///
-    /// The damage is not silent corruption, and it is worth being accurate
-    /// about which it is. A wrong base is caught three times over: a cast
-    /// that changes the width fails the length check in
-    /// [`crate::delta::compute_delta`], a cast that keeps it produces a
-    /// high-entropy XOR that [`crate::delta::pays_off`] rejects, and
-    /// anything that survives both fails the hash the load path verifies
-    /// after applying the delta. What it costs is the optimization it was
-    /// meant to provide — a full save where a delta belonged — or, in the
-    /// worst case, a checkpoint that refuses to load at resume. Two of those
-    /// three guards are heuristics about size, which is not what a
-    /// correctness argument should rest on; this is.
-    ///
-    /// Under the old all-or-nothing rule a single cast turned the whole
-    /// optimization off. Per tensor, the ordinary configuration — moments to
-    /// bf16, weights untouched — keeps the weights in memory, which is the
-    /// third of the state where the delta actually pays.
-    ///
-    /// A partial map needs no special handling downstream: `BaseCache` looks
-    /// each tensor up by name and falls back to storage on a miss, so a
-    /// tensor left out here simply takes the path it took before.
-    fn retain_base(
-        &self,
-        snap_id: Uuid,
-        tensors: Vec<TensorData>,
-        processed: &[tensor::ProcessedTensor],
-    ) {
-        if !self.config.keep_base_in_memory {
-            return;
-        }
-
-        // Only tensors stored in full, and uncast, can be delta'd against
-        // later from memory.
-        let full: std::collections::HashSet<&str> = processed
-            .iter()
-            .filter(|pt| {
-                pt.entry.storage == TensorStorage::Full && pt.entry.original_dtype.is_none()
-            })
-            .map(|pt| pt.entry.name.as_str())
-            .collect();
-
-        let retained: HashMap<String, Vec<u8>> = tensors
-            .into_iter()
-            .filter(|t| full.contains(t.name.as_str()))
-            .map(|t| (t.name, t.data))
-            .collect();
-
+    /// Called only for full snapshots, with buffers *moved* out of the
+    /// incoming data as each tensor was written — they are the ones that
+    /// would otherwise be dropped, so retaining them allocates nothing.
+    /// Which tensors are in `tensors` is decided by [`retainable`].
+    fn retain_base(&self, snap_id: Uuid, tensors: HashMap<String, Vec<u8>>) {
         *self.retained_base.lock().unwrap() = Some(RetainedBase {
             snap_id,
-            tensors: Arc::new(retained),
+            tensors: Arc::new(tensors),
         });
     }
 

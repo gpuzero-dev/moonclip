@@ -138,6 +138,8 @@ class MoonclipManager:
                 next delta does not read and decompress a base this process
                 just wrote. Costs one retained copy of the saved state in host
                 memory — turn it off where memory is the binding constraint.
+                Nothing is kept when no delta can follow (a full every step,
+                no deltas per full, or a cap of one snapshot).
             s3_session_token: The session token of temporary credentials,
                 which come with one beside the access key and the secret.
                 Read from the environment with keys read from there
@@ -172,6 +174,10 @@ class MoonclipManager:
         change. It is worth knowing about if a second thread touches the model
         — an EMA updater, a pruning callback, an async evaluation loop. Pass
         `(shape, dtype, bytes)` tuples there, or copy first.
+
+        With `async_save`, a save still being written is waited for before
+        the copy is taken, not after, so one copy of the state is in flight at
+        a time rather than two; `last_queue_wait()` reports that wait.
 
         Args:
             step: Training step.

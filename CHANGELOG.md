@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Saves and loads hold one copy of the state, and give the rest back
+  (GPU-443).** A save of a 1B-parameter run with its Adam state was killed
+  for memory. Measured on 576 MB of float32 state, resident memory over the
+  state went, at the peak and after four saves: a full every step from 4.4x
+  and 2.5x to 1.1x and nothing; deltas with the base kept from 4.6x and 2.2x
+  to 2.2x and the base alone (1.0x); without it from 4.6x and 2.7x to 1.3x
+  and nothing. A load went from 2.4x to 1.1x for a full and from 4.2x to 1.2x for
+  a delta. The causes, each fixed: the next shadow copy was taken while the
+  previous save was still being written (the copy now waits for it, and
+  `last_queue_wait()` reports the wait); the pack's blobs were all compressed
+  before any was written (they now go to the file in 64 MiB batches, the same
+  bytes in the same order); the base was kept under a full every step, where
+  no delta can use it, and the old base lived on through the next full; the
+  compressor and the delta path held tensor-sized buffers twice; a load read
+  large packs, and its base's, whole. What glibc keeps of freed buffers is
+  the caller's to bound, with its mmap and trim thresholds; Ravex holds them
+  at glibc's default for the whole run, and the figures above are measured
+  that way.
+  `Coordinator::wait_for_previous_save` and `StorageBackend::put_streamed`
+  are new; formats on disk are unchanged.
+
 ## 0.3.7 — 2026-11-18
 
 ### Changed

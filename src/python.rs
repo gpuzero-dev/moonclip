@@ -487,6 +487,12 @@ impl MoonclipManager {
         tensors: Bound<'_, PyDict>,
         metadata: Option<Bound<'_, PyDict>>,
     ) -> PyResult<String> {
+        // The previous save drains before this copy is taken, not after:
+        // otherwise two shadow copies of the state are alive at once
+        // (GPU-443). And before the tensors' pointers are read, not after,
+        // so the window in which another thread could change them stays one
+        // copy long rather than one whole save.
+        py.detach(|| self.inner.wait_for_previous_save());
         let pending = collect_tensors(&tensors)?;
         let meta = extract_metadata(metadata)?;
         // The shadow copy is Moonclip's work, so it belongs in Moonclip's pool

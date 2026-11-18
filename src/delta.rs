@@ -158,6 +158,30 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     Ok(xor_bytes(base, delta))
 }
 
+/// [`apply_delta`] into the base's own buffer, which becomes the target.
+///
+/// For the load path (GPU-443): the base was decompressed for this one
+/// tensor and nothing else reads it, so writing the result over it saves
+/// a tensor-sized buffer per thread in flight - the base, the delta and the
+/// result were all alive at once.
+pub fn apply_delta_in_place(base: &mut [u8], delta: &[u8]) -> Result<()> {
+    if base.len() != delta.len() {
+        return Err(MoonclipError::Delta(format!(
+            "base length {} != delta length {}",
+            base.len(),
+            delta.len()
+        )));
+    }
+    base.par_chunks_mut(SCAN_CHUNK)
+        .zip(delta.par_chunks(SCAN_CHUNK))
+        .for_each(|(b, d)| {
+            for i in 0..b.len() {
+                b[i] ^= d[i];
+            }
+        });
+    Ok(())
+}
+
 /// Compute the ratio of non-zero bytes in a delta.
 /// A low ratio (< 0.3) means delta encoding is very effective.
 /// A high ratio (> 0.7) means a full snapshot might be cheaper.

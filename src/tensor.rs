@@ -340,12 +340,18 @@ pub fn process_tensor(
                             // 19% smaller. See `crate::shuffle`.
                             let itemsize = shuffle::element_size(&working_dtype);
                             let shuffled = itemsize > 1;
+                            // The unshuffled delta goes as soon as the
+                            // shuffled one exists: it used to live through
+                            // the compression too, one more tensor-sized
+                            // buffer per thread at the peak (GPU-443).
                             let to_compress = if shuffled {
-                                Cow::Owned(profile::time(profile::Phase::Shuffle, || {
+                                let planes = profile::time(profile::Phase::Shuffle, || {
                                     shuffle::shuffle(&xor_delta, itemsize)
-                                }))
+                                });
+                                drop(xor_delta);
+                                planes
                             } else {
-                                Cow::Borrowed(&xor_delta[..])
+                                xor_delta
                             };
                             let compressed =
                                 profile::time(profile::Phase::CompressDelta, || {
@@ -639,6 +645,10 @@ fn load_tensor_raw(
         TensorStorage::DeltaXor => {
             let compressed = extract_compressed(entry, storage, pack)?;
             let mut delta_data = compression::decompress(&compressed, compression)?;
+            // Each buffer goes as soon as the next one exists: with a thread
+            // per core loading at once, every tensor-sized buffer kept alive
+            // here is that many times over in the load's peak (GPU-443).
+            drop(compressed);
             if entry.shuffled {
                 delta_data = shuffle::unshuffle(&delta_data, shuffle::element_size(&entry.dtype));
             }
@@ -652,7 +662,7 @@ fn load_tensor_raw(
             })?;
             let (base_entry, base_compression, base_pack) =
                 resolve_base_entry(base_id, &entry.name, find_base_entry)?;
-            let base_raw = load_tensor_raw(
+            let mut raw = load_tensor_raw(
                 &base_entry,
                 None,
                 storage,
@@ -661,8 +671,9 @@ fn load_tensor_raw(
                 find_base_entry,
             )?;
 
-            // Apply XOR delta
-            let raw = delta::apply_delta(&base_raw, &delta_data)?;
+            // Apply XOR delta, over the base: nothing else reads it.
+            delta::apply_delta_in_place(&mut raw, &delta_data)?;
+            drop(delta_data);
 
             // Verify reconstructed tensor integrity
             let actual = hash_hex(&raw);

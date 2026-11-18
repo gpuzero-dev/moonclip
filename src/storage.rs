@@ -25,6 +25,28 @@ pub trait StorageBackend: Send + Sync {
         self.put(rel_path, &buf)
     }
 
+    /// Write a file whose bytes `fill` produces piece by piece, as one object.
+    ///
+    /// For the pack (GPU-443): its blobs used to be gathered whole and handed
+    /// to `put_parts`, which kept a compressed copy of the entire state in
+    /// memory beside the shadow copy, and on a 1B-parameter run with its Adam
+    /// state that second copy was what the kernel killed the process for. A
+    /// backend that can write as the bytes arrive overrides this, and then
+    /// nothing in the file is held in memory; the default gathers them and
+    /// makes one `put_parts`, which is what every backend did before.
+    ///
+    /// Atomic like `put`: if `fill` fails, nothing is written under
+    /// `rel_path`.
+    fn put_streamed(
+        &self,
+        rel_path: &str,
+        fill: &mut dyn FnMut(&mut dyn PartSink) -> Result<()>,
+    ) -> Result<()> {
+        let mut sink = BufferedSink(Vec::new());
+        fill(&mut sink)?;
+        self.put_parts(rel_path, &[&sink.0])
+    }
+
     /// Write exactly `data`, byte for byte, whatever this backend does to
     /// the files it writes for itself.
     ///
@@ -275,10 +297,92 @@ fn held_open_elsewhere(_e: &std::io::Error) -> bool {
     false
 }
 
+/// A file being written by [`StorageBackend::put_streamed`].
+///
+/// A pack is written while its tensors are still being compressed, so that
+/// each compressed blob reaches the file and is freed before the next batch
+/// is produced (GPU-443). Two operations are enough for that: appending, and
+/// going back once to fill in the header, whose numbers are only known when
+/// the last byte has been appended.
+pub trait PartSink {
+    /// Add `bytes` at the end of what has been written so far.
+    fn append(&mut self, bytes: &[u8]) -> Result<()>;
+
+    /// Replace bytes already appended, starting `offset` bytes from the start
+    /// of the file. It may not extend the file: what it rewrites has to exist.
+    fn overwrite(&mut self, offset: u64, bytes: &[u8]) -> Result<()>;
+}
+
+/// The sink a backend without a streamed write gets: the bytes gather in
+/// memory and go out in one `put_parts` once the writer is done.
+struct BufferedSink(Vec<u8>);
+
+impl PartSink for BufferedSink {
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn overwrite(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        let start = offset as usize;
+        let end = start
+            .checked_add(bytes.len())
+            .filter(|end| *end <= self.0.len())
+            .ok_or_else(|| MoonclipError::Storage("overwrite past the end of a streamed write".into()))?;
+        self.0[start..end].copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// The local sink: straight into the temp file a write renames into place.
+struct FileSink<'a> {
+    file: &'a mut std::fs::File,
+    len: u64,
+}
+
+impl PartSink for FileSink<'_> {
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        self.file.write_all(bytes)?;
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn overwrite(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        if offset.saturating_add(bytes.len() as u64) > self.len {
+            return Err(MoonclipError::Storage(
+                "overwrite past the end of a streamed write".into(),
+            ));
+        }
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(bytes)?;
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(())
+    }
+}
+
 impl LocalStorage {
     /// Write `parts` atomically, padded with zeros to a multiple of
     /// `page_size` - 0 for none.
     fn write_parts(&self, rel_path: &str, parts: &[&[u8]], page_size: usize) -> Result<()> {
+        self.write_atomic(rel_path, page_size, &mut |sink| {
+            for part in parts {
+                sink.append(part)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Write whatever `fill` hands its sink atomically, padded with zeros to a
+    /// multiple of `page_size` - 0 for none. The bytes go to the temp file as
+    /// they come: nothing here holds the file's contents in memory.
+    fn write_atomic(
+        &self,
+        rel_path: &str,
+        page_size: usize,
+        fill: &mut dyn FnMut(&mut dyn PartSink) -> Result<()>,
+    ) -> Result<()> {
         use std::io::Write;
 
         let path = self.full_path(rel_path);
@@ -288,16 +392,16 @@ impl LocalStorage {
         };
 
         // Atomic write: temp file → rename. Parts are streamed directly
-        // to the file — no concatenated or padded copy of the data.
+        // to the file — no concatenated or padded copy of the data. A `fill`
+        // that fails leaves the temp file to be dropped, which deletes it.
         let dir = path.parent().unwrap_or(Path::new("."));
         let mut tmp = tempfile::Builder::new().prefix(PARTIAL_PREFIX).tempfile_in(dir)?;
         {
             let file = tmp.as_file_mut();
-            let mut total = 0usize;
-            for part in parts {
-                file.write_all(part)?;
-                total += part.len();
-            }
+            let mut sink = FileSink { file, len: 0 };
+            fill(&mut sink)?;
+            let total = sink.len as usize;
+            let file = sink.file;
             // Pad to page boundary for SSD longevity
             if page_size > 0 && total % page_size != 0 {
                 let pad = page_size - total % page_size;
@@ -346,6 +450,14 @@ impl StorageBackend for LocalStorage {
 
     fn put_parts(&self, rel_path: &str, parts: &[&[u8]]) -> Result<()> {
         self.write_parts(rel_path, parts, self.page_size)
+    }
+
+    fn put_streamed(
+        &self,
+        rel_path: &str,
+        fill: &mut dyn FnMut(&mut dyn PartSink) -> Result<()>,
+    ) -> Result<()> {
+        self.write_atomic(rel_path, self.page_size, fill)
     }
 
     fn put_exact(&self, rel_path: &str, data: &[u8]) -> Result<()> {

@@ -19,19 +19,37 @@ pub fn compress(data: &[u8], algo: &CompressionAlgo) -> Result<Vec<u8>> {
         CompressionAlgo::None => Ok(data.to_vec()),
         CompressionAlgo::Zstd { level } => {
             if data.len() <= PARALLEL_CHUNK {
-                return zstd::bulk::compress(data, *level)
-                    .map_err(|e| MoonclipError::Compression(e.to_string()));
+                let mut out = zstd::bulk::compress(data, *level)
+                    .map_err(|e| MoonclipError::Compression(e.to_string()))?;
+                // Allocated at zstd's worst case, the input's size and more;
+                // a delta compresses to a fraction of it, and a save holds a
+                // batch of these until they are written (GPU-443).
+                out.shrink_to_fit();
+                return Ok(out);
             }
-            let frames: std::io::Result<Vec<Vec<u8>>> = data
+            // Every frame is compressed straight into its own slot of one
+            // buffer, each slot as large as zstd's worst case for its chunk,
+            // and the frames are then moved down to sit end to end. Gathering
+            // them as separate frames and concatenating them held the tensor's
+            // compressed bytes twice at the peak, per thread at once - for
+            // state that barely compresses, two copies of every tensor being
+            // compressed (GPU-443). The bytes produced are the same frames.
+            let bound = zstd::zstd_safe::compress_bound(PARALLEL_CHUNK);
+            let chunks = data.len().div_ceil(PARALLEL_CHUNK);
+            let mut out = vec![0u8; bound * chunks];
+            let sizes: std::io::Result<Vec<usize>> = data
                 .par_chunks(PARALLEL_CHUNK)
-                .map(|chunk| zstd::bulk::compress(chunk, *level))
+                .zip(out.par_chunks_mut(bound))
+                .map(|(chunk, slot)| zstd::bulk::compress_to_buffer(chunk, slot, *level))
                 .collect();
-            let frames = frames.map_err(|e| MoonclipError::Compression(e.to_string()))?;
-            let total: usize = frames.iter().map(|f| f.len()).sum();
-            let mut out = Vec::with_capacity(total);
-            for f in &frames {
-                out.extend_from_slice(f);
+            let sizes = sizes.map_err(|e| MoonclipError::Compression(e.to_string()))?;
+            let mut end = 0;
+            for (i, size) in sizes.into_iter().enumerate() {
+                out.copy_within(i * bound..i * bound + size, end);
+                end += size;
             }
+            out.truncate(end);
+            out.shrink_to_fit();
             Ok(out)
         }
     }
