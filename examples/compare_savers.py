@@ -15,9 +15,10 @@ would.
 "Blocked" is what the training loop waits for: the whole save for torch.save
 and DCP, the copy of the tensors for Moonclip, whose hashing, delta and write
 run in the background: what is left of it after the last save, which only
-`flush()` waits for, is timed apart (GPU-413). "Written per save" is the size of one checkpoint for torch.save and DCP, and for Moonclip
-its store's size at the end divided by the saves: the first is a full
-snapshot and the rest are deltas against it.
+`flush()` waits for, is timed apart (GPU-413). "Written per save" is the size
+of one checkpoint for torch.save and DCP, and for Moonclip its store's size
+at the end divided by the saves: the first is a full snapshot and the rest
+are deltas against it.
 
 Printed as a Markdown table, with the machine it ran on, so a number in the
 README always says where it came from.
