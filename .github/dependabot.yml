@@ -6,12 +6,16 @@
 # all, which is the half of pinning that otherwise never happens. The
 # container images the workflows pin by digest are not in reach of any
 # ecosystem here, and are moved by hand.
+# Each update waits seven days after its release (GPU-493): a package
+# taken over and republished is usually found out within days.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
@@ -20,6 +24,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       crates:
         patterns: ["*"]
@@ -28,6 +34,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       python:
         patterns: ["*"]
