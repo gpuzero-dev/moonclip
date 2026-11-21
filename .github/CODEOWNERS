@@ -1,0 +1,5 @@
+# What publishes this repository, or decides how it is checked, is reviewed by
+# an owner whoever changes it (GPU-490): the workflows, Dependabot's settings
+# and this file, all under .github/. Public repositories cannot have GitHub's
+# push rulesets, so the main ruleset requires this review instead.
+/.github/ @JHNMACHINE
