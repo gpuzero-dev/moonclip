@@ -1,0 +1,35 @@
+# Dependabot (GPU-493). One pull request per ecosystem a week, every update
+# grouped into it: a pull request per dependency would bury the few that
+# matter, and the repository's CI runs on each one in full.
+#
+# github-actions moves the actions the workflows pin by commit, comment and
+# all, which is the half of pinning that otherwise never happens. The
+# container images the workflows pin by digest are not in reach of any
+# ecosystem here, and are moved by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  # Cargo.lock: what the crate and the wheels are built with (`--locked`).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      crates:
+        patterns: ["*"]
+  # pyproject.toml and requirements.txt: the build and test tools.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      python:
+        patterns: ["*"]
+  # No docker entry: this repository has no Dockerfile, and Dependabot
+  # reports an ecosystem with nothing to read as an error every week.

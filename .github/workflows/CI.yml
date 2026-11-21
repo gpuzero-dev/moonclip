@@ -30,6 +30,20 @@ on:
 permissions:
   contents: read
 
+# Pinned, all of it (GPU-493). Each action by its commit, with the tag beside
+# it: a tag can be moved by whoever controls the action, and CD.yml runs this
+# file on the commit it is about to publish. Each container image by its
+# digest: a tag like `rust:1.99.1-bookworm` is rebuilt upstream every few
+# weeks, so the same commit could otherwise build on a different system from
+# one day to the next. Dependabot moves the actions; the digests are moved by
+# hand, with `docker buildx imagetools inspect <image:tag>`.
+#
+# And every job has a `timeout-minutes`: GitHub's default is six hours, so a
+# test that hangs would hold the runner, and a release waiting on this file,
+# that long. Each value is several times the slowest green run of the job in
+# November 2026 (none took over three minutes), and never under fifteen,
+# because every job here compiles the crate from cold and a slow crates.io
+# mirror alone can triple that.
 jobs:
   # The quick gate. It has to be quick enough that it is never the reason to
   # skip a push, and honest enough to be worth looking at.
@@ -40,10 +54,11 @@ jobs:
   # nothing else in this file runs clippy, so this job stays: it is the gate.
   checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     container:
       # The same image as the `rust` and `bench` jobs below and CD.yml's
-      # `crate` job. Bump them together.
-      image: rust:1.99.1-bookworm
+      # `crate` job. Bump them together, digest included.
+      image: rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c
     steps:
       - name: Install git
         run: |
@@ -56,7 +71,7 @@ jobs:
       # silently tests main instead. A green tick for code nobody built is
       # worse than no tick.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -120,8 +135,9 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     container:
-      image: rust:1.99.1-bookworm
+      image: rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c
     steps:
       - name: Install deps
         run: |
@@ -134,7 +150,7 @@ jobs:
       # swallowed it, and the job tested main instead. Every PR check was a
       # green tick for code nobody had built.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -160,8 +176,15 @@ jobs:
         run: |
           set -eu
           VGW=1.8.0
+          # The sha256 versity publishes for this asset in the release's
+          # checksums.txt (GPU-493). A release asset can be replaced after the
+          # fact, and this binary runs with the job's network and files: a
+          # different one stops here instead of being run. Moving VGW means
+          # taking the new checksum from the new release.
+          VGW_SHA256=2ba2c734d10d2c4e651d03182cb4b246656bc735a2f282db7b0b73fba6073467
           curl -sSfL -o /tmp/vgw.tgz \
             "https://github.com/versity/versitygw/releases/download/v${VGW}/versitygw_v${VGW}_Linux_x86_64.tar.gz"
+          echo "${VGW_SHA256}  /tmp/vgw.tgz" | sha256sum -c -
           tar -xzf /tmp/vgw.tgz -C /tmp
           install -m 0755 "/tmp/versitygw_v${VGW}_Linux_x86_64/versitygw" /usr/local/bin/versitygw
           mkdir -p /tmp/s3-data/moonclip-test
@@ -200,8 +223,9 @@ jobs:
   # gets one job of its own with a real torch in it.
   torch-adapter:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     container:
-      image: python:3.12-bookworm
+      image: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     steps:
       - name: Install git and Rust
         run: |
@@ -216,7 +240,7 @@ jobs:
       # swallowed it, and the job tested main instead. Every PR check was a
       # green tick for code nobody had built.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -245,12 +269,24 @@ jobs:
         # and the build lists of the wheel jobs in CD.yml in step with each
         # other.
         python: ["3.11", "3.12", "3.13", "3.14"]
+        # The image of each interpreter, by digest (see the top of the file).
+        # A new interpreter goes in both lists.
+        include:
+          - python: "3.11"
+            image: python:3.11-bookworm@sha256:726d304906fa5eb468e5531e366548d1903286352f5adb54ef508ac01fbd80c6
+          - python: "3.12"
+            image: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
+          - python: "3.13"
+            image: python:3.13-bookworm@sha256:cc55e4ded9c95f6ce2133b3d096db43f214d280c2a8af65d83e246c8fa7d168c
+          - python: "3.14"
+            image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
+    timeout-minutes: 15
     container:
       # One official image per version. Each ships that interpreter with pip
       # already in it, so the job needs no Python version manager and no venv:
       # the container *is* the environment. Bookworm's own python3 is 3.11
       # only, which is why the image varies instead of the packages.
-      image: python:${{ matrix.python }}-bookworm
+      image: ${{ matrix.image }}
     steps:
       - name: Install git and Rust
         run: |
@@ -267,7 +303,7 @@ jobs:
       # swallowed it, and the job tested main instead. Every PR check was a
       # green tick for code nobody had built.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -291,8 +327,9 @@ jobs:
   # fetches the interpreter instead of the image providing it.
   python-free-threaded:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     container:
-      image: python:3.14-bookworm
+      image: python:3.14-bookworm@sha256:3fe825da0a80fa8e2cd79baadeb76b03c0ddf3d6cdbc8346778a0208b9d6038c
     steps:
       - name: Install git and Rust
         run: |
@@ -301,7 +338,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.99.1 --profile minimal --component clippy
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -346,10 +383,12 @@ jobs:
     # ruled out Codeberg's small runners, whose quota also counted the
     # release `target/`; `ubuntu-latest` has 16 GB and does not count disk.
     runs-on: ubuntu-latest
+    # The LTO build is the slow half, and the one most likely to grow.
+    timeout-minutes: 20
     container:
       # The same image as the `checks` and `rust` jobs above. Bump them
       # together.
-      image: rust:1.99.1-bookworm
+      image: rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c
     steps:
       - name: Install git
         run: |
@@ -360,7 +399,7 @@ jobs:
       # the default branch's tip, and a job that benchmarks a commit it did not
       # check out is worse than no job.
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
