@@ -12,8 +12,10 @@ name: Checks
 # Those wait for main.
 on:
   push:
-    branches-ignore: [main]
+    # deploy runs these itself, before it tags (GPU-443).
+    branches-ignore: [main, deploy]
   workflow_dispatch:
+  workflow_call:
 
 # The job token only reads: nothing here pushes, tags or comments, and releases
 # go out with their own PyPI and crates.io tokens.
