@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.8 — 2026-11-21
 
 ### Fixed
 
@@ -24,6 +24,19 @@
   that way.
   `Coordinator::wait_for_previous_save` and `StorageBackend::put_streamed`
   are new; formats on disk are unchanged.
+- **A merge reads each snapshot with its own compression and checks the
+  hashes before it replaces the originals (GPU-462).** A merge across
+  snapshots saved with different compressions no longer decodes one with
+  the other's codec, and a merged file whose hash does not match leaves the
+  originals in place. `max_full_snapshots=0`, which kept nothing to restore
+  from, is refused.
+- **Pins survive merges, a killed write is cleaned up at start, a delta's
+  checksum is checked before it is decompressed, and the storage stays
+  under its root (GPU-468).**
+- **A delete the remote refuses goes back in the queue (GPU-477)** and is
+  retried at the next sync, instead of leaving the object behind for good.
+- **A snapshot no rank finished leaves the manifest at restart (GPU-479)**,
+  so it no longer blocks every later merge.
 
 ## 0.3.7 — 2026-11-18
 
