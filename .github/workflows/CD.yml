@@ -1,37 +1,39 @@
-name: Release
+name: CD
 
+# A push to the deploy branch is a release: `git push origin main:deploy`
+# runs CI.yml on the commit, tags the version Cargo.toml and pyproject.toml
+# carry, and publishes it - the crate to crates.io, the sdist and the wheels to
+# PyPI. The same branch the other projects deploy from, so no tag is ever typed
+# by hand.
+#
+# The version is chosen by the commit (a `release: moonclip x.y.z` commit on
+# main bumps both files and the CHANGELOG), never here. A push whose version is
+# already tagged fails rather than doing nothing: the only reason to push here
+# is to publish, and a version that already went out is a bump that was
+# forgotten.
+#
+# Trusted publishing (GPU-412, GPU-489): PyPI's and crates.io's trusted
+# publishers for this repository must name `CD.yml` as the workflow, with the
+# `production` environment. The publish jobs live in this file now, not in a
+# reusable release workflow, and a publisher that still names an old file
+# refuses the token.
 on:
   push:
-    tags:
-      - 'v*'
-  # A manual run is a rehearsal: everything except the two uploads, with the
-  # crate going through `--dry-run` instead. It exists because a workflow that
-  # only triggers on tags can otherwise be tested only by spending version
-  # numbers — releasing 0.0.4 cost several delete-recreate-push cycles waiting on
-  # a busy runner. Publishing still requires a tag; no input turns a manual run
-  # into a real release.
-  workflow_dispatch:
-  # How a push to the deploy branch publishes (deploy.yml): it makes the tag
-  # and calls this with it, since a tag pushed with the job token would start
-  # no workflow. The caller's event is that push, so everything below that
-  # publishes on a push publishes here too.
-  workflow_call:
-    inputs:
-      tag:
-        type: string
-        required: true
+    branches: [deploy]
 
-# The job token only reads: nothing here pushes, tags or comments. The jobs
-# that publish also ask for an OIDC token, which PyPI and crates.io trade for a
-# publish token that expires on its own (trusted publishing, GPU-412): no index
-# token is stored anywhere.
+# Two pushes in a row each get their run, the second after the first: neither
+# may stop the other halfway through an upload.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+# The job token only reads: nothing pushes, tags or comments except the `tag`
+# job, which asks for its own write access. The jobs that publish also ask for
+# an OIDC token, which PyPI and crates.io trade for a publish token that
+# expires on its own (trusted publishing, GPU-412): no index token is stored
+# anywhere.
 permissions:
   contents: read
-
-# The tag being released: the one pushed, or the one deploy.yml made. On a
-# manual rehearsal, the branch it runs on.
-env:
-  TAG: ${{ inputs.tag || github.ref_name }}
 
 # One job per artifact. The split dates from when releases ran on Codeberg's
 # hosted runners, whose per-job time and memory quota counted filesystem writes
@@ -40,7 +42,70 @@ env:
 #
 # The cost is that the dependency tree compiles once per interpreter instead of
 # once in total, and queue time is cheaper than a release that cannot finish.
+#
+# Every publishing job below also needs `tag`, not only the job before it: the
+# `needs` context holds only a job's direct dependencies, and each of them reads
+# the tag from it. The order is unchanged, since `crate` already waits for
+# `tag`.
 jobs:
+  # The whole CI of this commit first, and nothing is tagged or published
+  # unless it passes (GPU-443, GPU-487): CI before CD. CI.yml also runs on its
+  # own for every other branch, but a release goes out only when everything it
+  # runs is green on the very commit that is published.
+  ci:
+    uses: ./.github/workflows/CI.yml
+
+  tag:
+    needs: ci
+    runs-on: ubuntu-latest
+    # The one job that writes: it pushes the tag. The jobs that publish keep a
+    # read-only job token and use their own short-lived publish tokens.
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      # Not shallow: the check below has to prove the commit is on main.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # The same provenance check the `crate` job makes of the tag: deploy
+      # publishes what main has, not a commit pushed there from a branch nobody
+      # merged.
+      - name: The commit must be on main
+        run: |
+          set -eu
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "deploy is at $(git rev-parse --short HEAD), which is not on main." >&2
+            echo "Push main to it: git push origin main:deploy. Nothing was tagged." >&2
+            exit 1
+          fi
+
+      - name: Tag the version
+        id: tag
+        run: |
+          set -eu
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          PY_VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          if [ "$VERSION" != "$PY_VERSION" ]; then
+            echo "Cargo.toml says $VERSION and pyproject.toml $PY_VERSION." >&2
+            exit 1
+          fi
+          TAG="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG is already released, at $(git rev-list -n1 "$TAG" | cut -c1-7)." >&2
+            echo "Bump the version in a release commit on main, then push main:deploy again." >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "moonclip $VERSION"
+          git push origin "refs/tags/$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tagged $TAG at $(git rev-parse --short HEAD)"
+
   # The crate first, deliberately. Neither artifact depends on the other — the
   # wheel carries the compiled extension and never fetches the crate — so the
   # order decides which half you are left holding if the release stops halfway.
@@ -56,12 +121,16 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    needs: tag
     runs-on: ubuntu-latest
     container:
       # Cargo already inside, so no rustup step. The verification build compiles
       # without `extension-module`, so it needs no Python interpreter to link
       # against.
       image: rust:1.99.1-bookworm
+    env:
+      # The tag the `tag` job just pushed.
+      TAG: ${{ needs.tag.outputs.tag }}
     steps:
       # curl for the crates.io index lookup below; the base image is expected
       # to carry both, but a release is the wrong place to find out otherwise.
@@ -76,15 +145,13 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          # The tag when deploy.yml calls; otherwise what triggered the run.
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.tag.outputs.tag }}
 
       # A tag can be pushed from any commit, including one on a branch nobody
       # reviewed. Note what this does *not* check: provenance, not freshness. A
       # tag pointing at an older commit *of* main passes — which is how 0.0.4
       # nearly went out without its own README.
       - name: Tag must be on main
-        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           # actions/checkout trusts the workspace only for its own git calls.
@@ -103,7 +170,6 @@ jobs:
       # Costs a grep, and rules out the one mistake that cannot be taken back.
       # Ahead of every build for that reason.
       - name: Tag must match the package version
-        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
@@ -121,8 +187,7 @@ jobs:
       # Both indexes, before either upload - including PyPI, which this job does
       # not upload to. Finding out PyPI does not trust this workflow after
       # crates.io has accepted the crate leaves the release half done, and
-      # neither index lets a version number be retried. Runs on a rehearsal
-      # too: it is how a manual run proves trusted publishing still works.
+      # neither index lets a version number be retried.
       - name: Both indexes must trust this workflow
         run: |
           set -eu
@@ -157,12 +222,6 @@ jobs:
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-
-          if [ "${{ github.event_name }}" != "push" ]; then
-            echo "rehearsal: packaging and compiling the crate, not uploading it"
-            cargo publish --dry-run --locked
-            exit 0
-          fi
 
           # `mo/on/moonclip` is the sparse-index layout: first two characters,
           # next two, then the name.
@@ -200,10 +259,12 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    needs: crate
+    needs: [tag, crate]
     runs-on: ubuntu-latest
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      TAG: ${{ needs.tag.outputs.tag }}
     steps:
       # The manylinux image carries the Python interpreters, not a Rust
       # toolchain — the `crate` job gets cargo from `rust:1.99.1-bookworm`, and
@@ -221,11 +282,9 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          # The tag when deploy.yml calls; otherwise what triggered the run.
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.tag.outputs.tag }}
 
       - name: Tag must match the package version
-        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
@@ -250,7 +309,6 @@ jobs:
           ls "$tmp"/*/pyproject.toml "$tmp"/*/Cargo.toml "$tmp"/*/src/lib.rs
 
       - name: Upload to PyPI
-        if: ${{ github.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
         run: |
@@ -284,7 +342,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    needs: sdist
+    needs: [tag, sdist]
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     container:
       # The PyPA manylinux image ships every supported CPython under
@@ -303,6 +361,8 @@ jobs:
         # the module safe without the GIL by default, so the same source
         # builds it; without this wheel a 3.14t user compiles from the sdist.
         python: [cp311, cp312, cp313, cp314, cp314t]
+    env:
+      TAG: ${{ needs.tag.outputs.tag }}
     steps:
       - name: Install Rust
         run: |
@@ -313,14 +373,12 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          # The tag when deploy.yml calls; otherwise what triggered the run.
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.tag.outputs.tag }}
 
       # Cheap, and repeated here on purpose: these jobs can be re-run
       # individually, and a wheel whose metadata disagrees with the tag is
       # exactly what the check in the crate job exists to prevent.
       - name: Tag must match the package version
-        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
@@ -360,7 +418,6 @@ jobs:
           "$PY" -c "import moonclip; print('moonclip', moonclip.__version__, 'imports')"
 
       - name: Upload to PyPI
-        if: ${{ github.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
         run: |
@@ -399,7 +456,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    needs: sdist
+    needs: [tag, sdist]
     # macos-15, not 14: GitHub retires the macOS 14 image on 2026-11-02, and
     # its scheduled brownouts already cancelled these jobs in the 0.3.2
     # release. The wheel still says MACOSX_DEPLOYMENT_TARGET below, not the
@@ -410,6 +467,7 @@ jobs:
       matrix:
         python: ['3.11', '3.12', '3.13', '3.14']
     env:
+      TAG: ${{ needs.tag.outputs.tag }}
       # The oldest macOS the wheel says it runs on; every Apple-silicon Mac
       # shipped with 11 or later.
       MACOSX_DEPLOYMENT_TARGET: '11.0'
@@ -418,7 +476,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.tag.outputs.tag }}
 
       - name: Python ${{ matrix.python }}
         uses: actions/setup-python@v5
@@ -426,7 +484,6 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Tag must match the package version
-        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
@@ -452,7 +509,6 @@ jobs:
           python -c "import moonclip; print('moonclip', moonclip.__version__, 'imports')"
 
       - name: Upload to PyPI
-        if: ${{ github.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
         run: |

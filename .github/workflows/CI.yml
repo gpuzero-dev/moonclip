@@ -1,30 +1,123 @@
 name: CI
 
-# Only `main`. The full suite is eight container jobs — MinIO, a PyTorch build
-# and a six-interpreter matrix, each compiling the extension from scratch — and
-# running it on the pull request *and* again on the merge paid for it twice for
-# the same code.
+# Every check this repository runs, in one file (GPU-489): the quick clippy and
+# unit-test gate, the full suite (the S3 backend, the PyTorch adapter, Python
+# 3.11 through 3.14 and 3.14t) and the delta benchmark. CD.yml calls this same
+# file on the commit it publishes, so what guards a branch and what guards a
+# release cannot drift apart.
 #
-# What guards the branch instead is `checks.yml`, which is fast and runs on
-# every push that is not main. The trade is deliberate and worth stating: a
-# branch is no longer proven against the full matrix before it is merged, so a
-# failure specific to, say, one interpreter or to the S3 backend now surfaces on
-# main rather than on the pull request. `main` is what `release.yml` publishes
-# from, so when that happens, fix forward promptly.
+# Every branch runs the full suite, not only main. That is the opposite of the
+# old split, where a branch got only the quick gate and the matrix waited for
+# main, so a failure specific to one interpreter or to the S3 backend surfaced
+# after the merge. It costs a container job per interpreter on each push; the
+# quick `checks` job still runs beside them, so a broken build or a clippy
+# finding is still reported first and with the shortest log.
 on:
   push:
-    branches: [main]
-  # Replay it without inventing a commit — the same reason ravex has one.
+    # deploy runs this file itself, through CD.yml, before it tags (GPU-443):
+    # triggering it here as well would run the whole suite twice on the same
+    # commit. Naming only branches also keeps a pushed tag from starting it.
+    branches-ignore: [deploy]
+  # Replay it without inventing a commit — the same reason ravex has one, and
+  # for the bench the more useful trigger: re-running it on an unchanged main
+  # is how you find out how much of a delta is just the runner.
   workflow_dispatch:
-  # deploy.yml runs it on the commit it publishes, before the tag.
+  # CD.yml runs it on the commit it publishes, before the tag.
   workflow_call:
 
 # The job token only reads: nothing here pushes, tags or comments, and releases
-# go out with their own PyPI and crates.io tokens.
+# go out from CD.yml with their own short-lived publish tokens.
 permissions:
   contents: read
 
 jobs:
+  # The quick gate. It has to be quick enough that it is never the reason to
+  # skip a push, and honest enough to be worth looking at.
+  #
+  # One job, one container, no S3 server and no interpreter matrix: `cargo
+  # test` covers the library in seconds, and clippy covers the rest. The `rust`
+  # job below runs a superset of these tests against a real S3 server, but
+  # nothing else in this file runs clippy, so this job stays: it is the gate.
+  checks:
+    runs-on: ubuntu-latest
+    container:
+      # The same image as the `rust` and `bench` jobs below and CD.yml's
+      # `crate` job. Bump them together.
+      image: rust:1.99.1-bookworm
+    steps:
+      - name: Install git
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git
+
+      # Not shallow, and the checkout is allowed to fail the job — the same
+      # reasoning as the other jobs: `--depth 1` fetches only the default
+      # branch's tip, so the pushed commit is not in the clone and the job
+      # silently tests main instead. A green tick for code nobody built is
+      # worse than no tick.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Clippy
+        run: |
+          set -eu
+          rustup component add clippy
+          # `-D warnings` so a new lint fails the branch rather than scrolling
+          # past. One allowance remains:
+          #
+          #   too_many_arguments  MoonclipManager::new takes 24 — it is the
+          #                       Python constructor, and every argument is a
+          #                       documented keyword.
+          #
+          # Anything not on this list is a real finding and stops the push.
+          #
+          # `type_complexity`, `unnecessary_sort_by` and `manual_checked_ops`
+          # used to be here as well. The last two only exist from clippy 1.97,
+          # which this container did not have, so they were listed against a
+          # toolchain that could not raise them; all three findings are fixed
+          # and the lines are gone with them.
+          #
+          # `-A unknown-lints` stays, and is now the only thing keeping this
+          # readable across a toolchain change: naming a lint an older clippy
+          # does not know is `error[E0602]`, which `-D warnings` turns into a
+          # hard failure. This job had never passed for exactly that reason.
+          # What it costs is that a misspelled lint name above is ignored
+          # rather than reported.
+          cargo clippy --all-targets --features python -- \
+            -D warnings \
+            -A unknown-lints \
+            -A clippy::too_many_arguments
+
+      # Last, because a compile error should be reported by clippy above with a
+      # better message than a bare test failure — and split in two so that when
+      # something does go red, the step name already says whether it was the
+      # build or the tests. Compiling first also keeps the test step's log to
+      # test output instead of a wall of rustc.
+      - name: Build the test binaries
+        run: |
+          set -eu
+          cargo test --no-run --lib --tests
+
+      - name: Rust tests
+        run: |
+          set -eu
+          cargo test --lib --tests
+
+      # No bench target here, deliberately. This used to be `--all-targets`,
+      # which does not just build `delta_bench` — it runs it: `harness = false`
+      # means cargo executes the binary's `main` rather than probing it for test
+      # cases, and that main walks three 256 MB buffers five times. The branch
+      # guard was spending most of its budget measuring memory bandwidth, in a
+      # debug build, and reporting the result as a test pass. The timings now
+      # live in the `bench` job below, on main.
+      #
+      # Nothing is lost by not building it here: the clippy step above passes
+      # `--all-targets`, so a change to `delta` that leaves the bench
+      # uncompilable still fails this job — with a better message, and without
+      # codegen.
+
   rust:
     runs-on: ubuntu-latest
     container:
@@ -147,9 +240,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every version release.yml ships a wheel for: a version we publish is
-        # a version we test. Keep this list, the classifiers in pyproject.toml,
-        # and the build list in release.yml in step with each other.
+        # Every version CD.yml ships a wheel for: a version we publish is a
+        # version we test. Keep this list, the classifiers in pyproject.toml,
+        # and the build lists of the wheel jobs in CD.yml in step with each
+        # other.
         python: ["3.11", "3.12", "3.13", "3.14"]
     container:
       # One official image per version. Each ships that interpreter with pip
@@ -191,7 +285,7 @@ jobs:
           maturin develop
           pytest tests/ -v
 
-  # The free-threaded build of 3.14, which release.yml ships a cp314t wheel for
+  # The free-threaded build of 3.14, which CD.yml ships a cp314t wheel for
   # (GPU-189). Its own job rather than a fifth matrix entry: the official
   # `python:3.14` image has the GIL, and no official image has 3.14t, so uv
   # fetches the interpreter instead of the image providing it.
@@ -227,3 +321,59 @@ jobs:
           # would pass, on what is then an ordinary interpreter.
           python -c "import sys, moonclip; assert not sys._is_gil_enabled(), 'importing moonclip re-enabled the GIL'"
           pytest tests -v
+
+  # Split out of the quick gate, where it never belonged. The Rust step there
+  # was `cargo test --all-targets`, and that does not merely build
+  # `delta_bench` — it runs it. `harness = false` means cargo executes the
+  # binary's `main` instead of probing it for test cases, so every branch push
+  # was walking three 256 MB buffers five times, in a debug build, on the small
+  # runner whose entire job is to answer quickly. It measured nothing usable
+  # and spent the guard's budget doing it.
+  #
+  # Nothing here guards compilation. The `checks` job type-checks the bench on
+  # every push already, because its clippy invocation passes `--all-targets` —
+  # which is why dropping the bench from that job cost nothing.
+  bench:
+    # Main only, and never on a branch or in a release run from CD.yml. What
+    # comes out of a shared runner is a tripwire, not a measurement: useful for
+    # noticing that `delta` got an order of magnitude slower, useless for
+    # anything finer, so it is worth its slow LTO build only where the numbers
+    # can be compared run after run. A number worth quoting needs a machine
+    # whose neighbours are known.
+    if: ${{ github.ref == 'refs/heads/main' }}
+    # The bench holds base, target and a distinct copy of base at 256 MB each,
+    # plus a transient output buffer per call, so it peaks near 1.1 GB. That
+    # ruled out Codeberg's small runners, whose quota also counted the
+    # release `target/`; `ubuntu-latest` has 16 GB and does not count disk.
+    runs-on: ubuntu-latest
+    container:
+      # The same image as the `checks` and `rust` jobs above. Bump them
+      # together.
+      image: rust:1.99.1-bookworm
+    steps:
+      - name: Install git
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git
+
+      # Not shallow, same reasoning as the other jobs: `--depth 1` fetches only
+      # the default branch's tip, and a job that benchmarks a commit it did not
+      # check out is worse than no job.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # `--locked` because the whole value of a number here is comparing it with
+      # the previous one, and a dependency that updated underneath makes that
+      # comparison a lie without saying so.
+      #
+      # `cargo bench` rather than building and invoking the binary by hand: the
+      # bench profile inherits `[profile.release]`, so this is the `lto = true`,
+      # `codegen-units = 1` build. That is the only build worth timing — and
+      # also the slow half of this job. If it ever runs past the runner's clock,
+      # suspect the link-time optimisation, not the benchmark.
+      - name: Run the delta benchmark
+        run: |
+          set -eu
+          cargo bench --bench delta_bench --locked
