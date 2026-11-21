@@ -647,7 +647,10 @@ mod tests {
         let freed = store.sweep_partials("snapshots", std::time::Duration::ZERO).unwrap();
         assert_eq!(freed, (b"half".len() + b"left by a crash".len()) as u64);
         assert!(!partial.exists());
-        assert_eq!(store.list("snapshots").unwrap(), listed);
+        // A listing comes in the directory's order, which differs between filesystems.
+        let mut after = store.list("snapshots").unwrap();
+        after.sort();
+        assert_eq!(after, listed);
     }
 
     /// Listed keys must be usable as keys — by `get` here, and by whatever
