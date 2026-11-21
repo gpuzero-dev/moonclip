@@ -2,4 +2,4 @@
 maturin>=1.5
 
 # Test
-pytest>=7.0
+pytest>=9.2.0
