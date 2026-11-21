@@ -16,6 +16,8 @@ on:
     branches: [main]
   # Replay it without inventing a commit — the same reason ravex has one.
   workflow_dispatch:
+  # deploy.yml runs it on the commit it publishes, before the tag.
+  workflow_call:
 
 # The job token only reads: nothing here pushes, tags or comments, and releases
 # go out with their own PyPI and crates.io tokens.

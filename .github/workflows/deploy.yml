@@ -24,14 +24,16 @@ permissions:
   contents: read
 
 jobs:
-  # The tests first, and nothing is tagged unless they pass (GPU-443): the
-  # release commit of ravex 0.14.4 and moonclip 0.3.8 went out with red
-  # Checks, because those ran beside this workflow and gated nothing.
-  checks:
-    uses: ./.github/workflows/checks.yml
+  # The whole CI of this commit first, and nothing is tagged unless it
+  # passes (GPU-443, GPU-487): CI before CD. ci.yml on main runs beside this
+  # workflow and gates nothing, and checks.yml alone is one interpreter of
+  # the unit suite; a release goes out only when everything main runs is
+  # green on the very commit that is published.
+  ci:
+    uses: ./.github/workflows/ci.yml
 
   tag:
-    needs: checks
+    needs: ci
     runs-on: ubuntu-latest
     # The one job that writes: it pushes the tag. Everything that publishes
     # runs in release.yml, with its own tokens and a read-only job token.
