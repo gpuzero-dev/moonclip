@@ -104,10 +104,15 @@ jobs:
   tag:
     needs: ci
     runs-on: ubuntu-latest
-    # The one job that writes: it pushes the tag. The jobs that publish keep a
-    # read-only job token and use their own short-lived publish tokens.
+    # The one job that writes: it pushes the tag, with the deploy key that
+    # only this environment holds. `production` opens only for deploy, where
+    # only the owner pushes, and the tags ruleset lets nothing but that key
+    # create a v* tag: a workflow on someone else's branch, with the job
+    # token, could otherwise take a version before its release (GPU-490).
+    # The job token itself stays read-only, as the publishing jobs' do.
+    environment: production
     permissions:
-      contents: write
+      contents: read
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
@@ -135,6 +140,8 @@ jobs:
       # the failed jobs of that CD run, not to push again (GPU-493).
       - name: Tag the version
         id: tag
+        env:
+          TAG_DEPLOY_KEY: ${{ secrets.TAG_DEPLOY_KEY }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
@@ -153,7 +160,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "moonclip $VERSION"
-          git push origin "refs/tags/$TAG"
+          # Over SSH with the deploy key, against GitHub's host key as its
+          # API publishes it (api.github.com/meta), never one fetched here.
+          umask 077
+          printf '%s\n' "$TAG_DEPLOY_KEY" > "$RUNNER_TEMP/tag_key"
+          printf '%s\n' "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$RUNNER_TEMP/known_hosts"
+          GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/tag_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts" \
+            git push "git@github.com:${GITHUB_REPOSITORY}.git" "refs/tags/$TAG"
+          rm -f "$RUNNER_TEMP/tag_key"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "tagged $TAG at $(git rev-parse --short HEAD)"
 
