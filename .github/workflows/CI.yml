@@ -138,10 +138,14 @@ jobs:
       # codegen.
       - name: Stop the whole run
         if: failure()
+        env:
+          MATRIX: ${{ matrix && toJSON(matrix) || '' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
+            // The cancel marks this job cancelled too: the error says which one failed.
+            core.error(`${context.job} ${process.env.MATRIX} failed: the rest of the run is cancelled`);
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId });
 
   rust:
     runs-on: ubuntu-latest
@@ -227,10 +231,14 @@ jobs:
         run: cargo test
       - name: Stop the whole run
         if: failure()
+        env:
+          MATRIX: ${{ matrix && toJSON(matrix) || '' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
+            // The cancel marks this job cancelled too: the error says which one failed.
+            core.error(`${context.job} ${process.env.MATRIX} failed: the rest of the run is cancelled`);
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId });
 
   # The matrix job below installs no torch, so everything behind
   # `importorskip("torch")` is skipped there: the engine is covered on six
@@ -276,10 +284,14 @@ jobs:
           pytest tests/ -v
       - name: Stop the whole run
         if: failure()
+        env:
+          MATRIX: ${{ matrix && toJSON(matrix) || '' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
+            // The cancel marks this job cancelled too: the error says which one failed.
+            core.error(`${context.job} ${process.env.MATRIX} failed: the rest of the run is cancelled`);
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId });
 
   python:
     runs-on: ubuntu-latest
@@ -343,10 +355,14 @@ jobs:
           pytest tests/ -v
       - name: Stop the whole run
         if: failure()
+        env:
+          MATRIX: ${{ matrix && toJSON(matrix) || '' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
+            // The cancel marks this job cancelled too: the error says which one failed.
+            core.error(`${context.job} ${process.env.MATRIX} failed: the rest of the run is cancelled`);
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId });
 
   # The free-threaded build of 3.14, which CD.yml ships a cp314t wheel for
   # (GPU-189). Its own job rather than a fifth matrix entry: the official
@@ -387,10 +403,14 @@ jobs:
           pytest tests -v
       - name: Stop the whole run
         if: failure()
+        env:
+          MATRIX: ${{ matrix && toJSON(matrix) || '' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
+            // The cancel marks this job cancelled too: the error says which one failed.
+            core.error(`${context.job} ${process.env.MATRIX} failed: the rest of the run is cancelled`);
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId });
 
   # Split out of the quick gate, where it never belonged. The Rust step there
   # was `cargo test --all-targets`, and that does not merely build
@@ -451,7 +471,11 @@ jobs:
           cargo bench --bench delta_bench --locked
       - name: Stop the whole run
         if: failure()
+        env:
+          MATRIX: ${{ matrix && toJSON(matrix) || '' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
+            // The cancel marks this job cancelled too: the error says which one failed.
+            core.error(`${context.job} ${process.env.MATRIX} failed: the rest of the run is cancelled`);
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId });
