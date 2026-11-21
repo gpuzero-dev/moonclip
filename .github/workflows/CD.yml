@@ -96,6 +96,10 @@ jobs:
   ci:
     needs: window
     uses: ./.github/workflows/CI.yml
+    # CI.yml's jobs cancel the whole run when one fails (fail fast).
+    permissions:
+      contents: read
+      actions: write
 
   tag:
     needs: ci

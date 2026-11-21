@@ -29,6 +29,10 @@ on:
 # go out from CD.yml with their own short-lived publish tokens.
 permissions:
   contents: read
+  # actions: write is for the last step of every job (fail fast): a job that
+  # fails cancels the whole run, and with it the CD that called it, so no
+  # other job keeps spending minutes on a commit already known to be bad.
+  actions: write
 
 # Pinned, all of it (GPU-493). Each action by its commit, with the tag beside
 # it: a tag can be moved by whoever controls the action, and CD.yml runs this
@@ -132,6 +136,12 @@ jobs:
       # `--all-targets`, so a change to `delta` that leaves the bench
       # uncompilable still fails this job — with a better message, and without
       # codegen.
+      - name: Stop the whole run
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
 
   rust:
     runs-on: ubuntu-latest
@@ -215,6 +225,12 @@ jobs:
           MOONCLIP_S3_ACCESS_KEY: minioadmin
           MOONCLIP_S3_SECRET_KEY: minioadmin
         run: cargo test
+      - name: Stop the whole run
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
 
   # The matrix job below installs no torch, so everything behind
   # `importorskip("torch")` is skipped there: the engine is covered on six
@@ -258,11 +274,16 @@ jobs:
           # test_multirank spawns one process per rank and talks over gloo on
           # loopback, so the runner needs no GPU and no special networking.
           pytest tests/ -v
+      - name: Stop the whole run
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
 
   python:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
         # Every version CD.yml ships a wheel for: a version we publish is a
         # version we test. Keep this list, the classifiers in pyproject.toml,
@@ -320,6 +341,12 @@ jobs:
           pip install --quiet maturin pytest
           maturin develop
           pytest tests/ -v
+      - name: Stop the whole run
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
 
   # The free-threaded build of 3.14, which CD.yml ships a cp314t wheel for
   # (GPU-189). Its own job rather than a fifth matrix entry: the official
@@ -358,6 +385,12 @@ jobs:
           # would pass, on what is then an ordinary interpreter.
           python -c "import sys, moonclip; assert not sys._is_gil_enabled(), 'importing moonclip re-enabled the GIL'"
           pytest tests -v
+      - name: Stop the whole run
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
 
   # Split out of the quick gate, where it never belonged. The Rust step there
   # was `cargo test --all-targets`, and that does not merely build
@@ -416,3 +449,9 @@ jobs:
         run: |
           set -eu
           cargo bench --bench delta_bench --locked
+      - name: Stop the whole run
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.actions.cancelWorkflowRun({ ...context.repo, run_id: context.runId })
