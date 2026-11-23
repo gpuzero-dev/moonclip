@@ -367,7 +367,7 @@ jobs:
         run: |
           set -eu
           . "$HOME/.cargo/env"
-          /opt/python/cp312-cp312/bin/pip install --quiet maturin twine
+          /opt/python/cp312-cp312/bin/pip install --quiet maturin "twine>=6.1" pypi-attestations==0.0.31
           export PATH="/opt/python/cp312-cp312/bin:$PATH"
           maturin sdist --out dist
           ls -la dist/
@@ -392,7 +392,17 @@ jobs:
           # failed jobs of this CD run rather than pushing deploy again, which
           # the `tag` job would refuse (GPU-493). `--skip-existing` keeps the
           # re-run from tripping over the files that did go out.
-          /opt/python/cp312-cp312/bin/twine upload --skip-existing dist/*.tar.gz
+          #
+          # With a PEP 740 attestation (GPU-491): signed with Sigstore under
+          # this job's own OIDC identity - this repository, this workflow, the
+          # tagged commit - and uploaded beside the file, so anyone installing
+          # can check that PyPI's moonclip was built here and not uploaded
+          # from elsewhere with a stolen token; PyPI checks it against the
+          # trusted publisher before it accepts the file. Every wheel job
+          # below does the same. Signed after `twine check`, which would take
+          # the .attestation file for a distribution it cannot read.
+          /opt/python/cp312-cp312/bin/python -m pypi_attestations sign dist/*.tar.gz
+          /opt/python/cp312-cp312/bin/twine upload --attestations --skip-existing dist/*
 
   # One wheel per interpreter, one job each. Native wheels rather than a single
   # abi3 one: the stable ABI would cost PyO3's fast paths, which is the wrong
@@ -481,7 +491,7 @@ jobs:
           PY="/opt/python/${ABI%t}-${ABI}/bin/python"
           test -x "$PY" || { echo "interpreter missing: $PY" >&2; exit 1; }
 
-          /opt/python/cp312-cp312/bin/pip install --quiet maturin twine
+          /opt/python/cp312-cp312/bin/pip install --quiet maturin "twine>=6.1" pypi-attestations==0.0.31
           export PATH="/opt/python/cp312-cp312/bin:$PATH"
 
           maturin build --release --locked --out dist --interpreter "$PY"
@@ -529,7 +539,10 @@ jobs:
           # filename anyway, so the content cannot actually change — what is lost
           # is only the loud complaint, and idempotent re-runs are worth more
           # than that in a six-job matrix.
-          /opt/python/cp312-cp312/bin/twine upload --skip-existing dist/*.whl
+          #
+          # With its attestation, as the sdist's (GPU-491).
+          /opt/python/cp312-cp312/bin/python -m pypi_attestations sign dist/*.whl
+          /opt/python/cp312-cp312/bin/twine upload --attestations --skip-existing dist/*
 
   # macOS on Apple silicon (GPU-311): where most people try a library first.
   # Without a wheel, `pip install moonclip` there needed Rust and Ravex fell
@@ -589,7 +602,7 @@ jobs:
           # times at once: left to cargo, two of them race to add the same
           # component (see rust-toolchain.toml).
           rustup toolchain install 1.99.1 --profile minimal --component clippy
-          python -m pip install --quiet maturin twine
+          python -m pip install --quiet maturin "twine>=6.1" pypi-attestations==0.0.31
           maturin build --release --locked --out dist --interpreter python
           ls -la dist/
           ls dist/ | grep -q -- "macosx_.*_arm64" || { echo "no macOS arm64 wheel in dist/" >&2; exit 1; }
@@ -611,4 +624,6 @@ jobs:
           # failed jobs of this CD run rather than pushing deploy again, which
           # the `tag` job would refuse (GPU-493). `--skip-existing` keeps the
           # re-run from tripping over the files that did go out.
-          python -m twine upload --skip-existing dist/*.whl
+          # With its attestation, as the sdist's (GPU-491).
+          python -m pypi_attestations sign dist/*.whl
+          python -m twine upload --attestations --skip-existing dist/*
