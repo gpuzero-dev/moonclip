@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.9 — 2026-11-23
+
+### Changed
+
+- **Every file on PyPI comes with a PEP 740 attestation (GPU-491).** The
+  sdist and each wheel are signed with Sigstore under the release
+  workflow's own identity and uploaded beside it, so `pip` users can check
+  that a moonclip file was built by this repository's CD from the tagged
+  commit, not uploaded from elsewhere with a stolen token. No change to
+  the library itself.
+
 ## 0.3.8 — 2026-11-21
 
 ### Fixed
