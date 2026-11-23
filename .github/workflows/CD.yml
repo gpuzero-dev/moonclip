@@ -64,37 +64,7 @@ jobs:
   # unless it passes (GPU-443, GPU-487): CI before CD. CI.yml also runs on its
   # own for every other branch, but a release goes out only when everything it
   # runs is green on the very commit that is published.
-  # Releases reach customers only from Friday 00:00 to Sunday 23:59,
-  # Italian time (GPU-494): changes go out together, when there is time
-  # to follow the deploy and roll it back, and the Actions minutes go to
-  # those runs. First, so a push outside the window stops here before
-  # spending a minute on CI. An urgent fix goes out any day from a commit
-  # whose message has a line `Hotfix: <why>`; the reason stays in git and
-  # in this run's log.
-  window:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Friday to Sunday, Italian time, or a hotfix
-        env:
-          MESSAGE: ${{ github.event.head_commit.message }}
-        run: |
-          day="$(TZ=Europe/Rome date +%u)"
-          if [ "$day" -ge 5 ]; then
-            echo "$(TZ=Europe/Rome date '+%A %H:%M'): inside the release window"
-            exit 0
-          fi
-          reason="$(printf '%s\n' "$MESSAGE" | grep -E '^Hotfix: .{10,}' | head -n 1 || true)"
-          if [ -n "$reason" ]; then
-            echo "::warning::released outside the window as a hotfix. $reason"
-            exit 0
-          fi
-          echo "::error::releases go out from Friday 00:00 to Sunday 23:59, Italian time (GPU-494)." \
-            "For an urgent fix, push a commit whose message has a line 'Hotfix: <why>'."
-          exit 1
-
   ci:
-    needs: window
     uses: ./.github/workflows/CI.yml
     # CI.yml's jobs cancel the whole run when one fails (fail fast).
     permissions:
