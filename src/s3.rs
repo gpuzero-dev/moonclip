@@ -356,15 +356,22 @@ pub struct S3Storage {
 
 impl S3Storage {
     pub fn new(config: S3Config) -> Result<Self> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(config.timeout_secs))
-            .timeout_read(std::time::Duration::from_secs(config.timeout_secs * 10))
-            .timeout_write(std::time::Duration::from_secs(config.timeout_secs * 10))
+        let secs = |n| Some(std::time::Duration::from_secs(n));
+        let agent = ureq::Agent::config_builder()
+            .timeout_connect(secs(config.timeout_secs))
+            // Per read and per write, not for the whole body: a large
+            // checkpoint takes as long as it takes, a stalled one does not.
+            .timeout_per_read(secs(config.timeout_secs * 10))
+            .timeout_per_write(secs(config.timeout_secs * 10))
             // One connection kept open per transfer the remote sync runs at
             // once (GPU-235). ureq keeps one per host by default, so the other
             // transfers would open a connection, TLS included, per request.
             .max_idle_connections_per_host(crate::remote_sync::TRANSFERS)
-            .build();
+            // A refusal is read here, body included: S3 says why in it, and
+            // ureq's own error for a status carries only the code.
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
         let bucket = bucket_of(&config)?;
         let credentials = match &config.session_token {
             Some(token) => Credentials::new_with_token(&config.access_key, &config.secret_key, token),
@@ -413,10 +420,7 @@ impl S3Storage {
             "POST" => Method::Post,
             _ => return Err(MoonclipError::Storage(format!("Unknown method: {method}"))),
         };
-        let url = self
-            .bucket
-            .object_url(key)
-            .map_err(|e| MoonclipError::Storage(format!("S3 key {key:?} is not a path: {e}")))?;
+        let url = self.bucket.object_url(key);
         let mut query = query.to_vec();
         query.sort_unstable();
         let credentials = self.credentials()?;
@@ -454,7 +458,7 @@ impl S3Storage {
         key: &str,
         body: Option<&[u8]>,
         query_params: &[(&str, &str)],
-    ) -> std::result::Result<ureq::Response, MoonclipError> {
+    ) -> std::result::Result<Answer, MoonclipError> {
         let mut backoff = std::time::Duration::from_millis(200);
         let mut attempt = 0;
         loop {
@@ -478,14 +482,11 @@ impl S3Storage {
     /// and the same of V1 - while it takes it there on every other request,
     /// and takes the token as a signed header of a presigned URL on none. So a
     /// store written with keys scoped to its bucket could be saved and never
-    /// restored. `rusty-s3` 0.10 signs presigned URLs only, so this one kind
-    /// of request is signed here: SigV4 in its header form, checked against
-    /// AWS's own example below.
-    fn listed(&self, query: &[(&str, &str)]) -> std::result::Result<ureq::Response, MoonclipError> {
-        let mut url = self
-            .bucket
-            .object_url("")
-            .map_err(|e| MoonclipError::Storage(format!("S3 bucket address: {e}")))?;
+    /// restored. `rusty-s3` (0.11 too) signs presigned URLs only, so this one
+    /// kind of request is signed here: SigV4 in its header form, checked
+    /// against AWS's own example below.
+    fn listed(&self, query: &[(&str, &str)]) -> std::result::Result<Answer, MoonclipError> {
+        let mut url = self.bucket.object_url("");
         let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
         let credentials = self.credentials()?;
         let (query_string, headers) = header_signed(
@@ -500,9 +501,9 @@ impl S3Storage {
         url.set_query(if query_string.is_empty() { None } else { Some(&query_string) });
         let mut request = self.agent.get(url.as_str());
         for (name, value) in &headers {
-            request = request.set(name, value);
+            request = request.header(*name, value);
         }
-        request.call().map_err(|e| status_error("", e))
+        answered("", request.call())
     }
 
     fn attempt_request(
@@ -511,7 +512,7 @@ impl S3Storage {
         key: &str,
         body: Option<&[u8]>,
         query_params: &[(&str, &str)],
-    ) -> std::result::Result<ureq::Response, MoonclipError> {
+    ) -> std::result::Result<Answer, MoonclipError> {
         // A role's credentials are temporary: they always carry a token.
         if method == "GET" && key.is_empty() && (self.config.session_token.is_some() || self.config.role.is_some()) {
             return self.listed(query_params);
@@ -519,22 +520,18 @@ impl S3Storage {
         let url = self.signed_url(method, key, query_params)?;
         // Nothing to set beyond the URL: the signature covers only the host,
         // and ureq sends that and the body's length on its own.
-        let req = match method {
-            "GET" => self.agent.get(url.as_str()),
-            "PUT" => self.agent.put(url.as_str()),
-            "DELETE" => self.agent.delete(url.as_str()),
-            "HEAD" => self.agent.head(url.as_str()),
-            "POST" => self.agent.post(url.as_str()),
+        let url = url.as_str();
+        let response = match (method, body) {
+            ("GET", _) => self.agent.get(url).call(),
+            ("HEAD", _) => self.agent.head(url).call(),
+            ("DELETE", _) => self.agent.delete(url).call(),
+            ("PUT", Some(data)) => self.agent.put(url).send(data),
+            ("PUT", None) => self.agent.put(url).send_empty(),
+            ("POST", Some(data)) => self.agent.post(url).send(data),
+            ("POST", None) => self.agent.post(url).send_empty(),
             _ => return Err(MoonclipError::Storage(format!("Unknown method: {method}"))),
         };
-
-        let response = if let Some(data) = body {
-            req.send_bytes(data)
-        } else {
-            req.call()
-        };
-
-        response.map_err(|e| status_error(key, e))
+        answered(key, response)
     }
 
     /// Upload an object in parts, because S3 will not take it in one.
@@ -553,7 +550,8 @@ impl S3Storage {
         let key = &self.config.object_key(rel_path);
         let created = self.do_request("POST", key, None, &[("uploads", "")])?;
         let body = created
-            .into_string()
+            .into_body()
+            .read_to_string()
             .map_err(|e| MoonclipError::Storage(format!("S3 multipart start: {e}")))?;
         let upload_id = extract_xml_value(&body, "UploadId").ok_or_else(|| {
             MoonclipError::Storage("S3 multipart start returned no UploadId".into())
@@ -606,7 +604,7 @@ impl S3Storage {
             }
 
             let response = self.do_request("GET", "", None, &params)?;
-            let body = response.into_string().map_err(|e| {
+            let body = response.into_body().read_to_string().map_err(|e| {
                 MoonclipError::Storage(format!("S3 multipart listing parse error: {e}"))
             })?;
 
@@ -657,9 +655,7 @@ impl S3Storage {
     pub fn etag(&self, rel_path: &str) -> Result<Option<String>> {
         let key = self.config.object_key(rel_path);
         let response = self.do_request("HEAD", &key, None, &[])?;
-        Ok(response
-            .header("ETag")
-            .map(|value| value.trim_matches('"').to_string()))
+        Ok(etag_of(&response).map(|value| value.trim_matches('"').to_string()))
     }
 
     /// The parts themselves, and the completion that makes them an object.
@@ -684,7 +680,7 @@ impl S3Storage {
 
             // The ETag identifies the part in the completion, and S3 rejects
             // the whole upload if one is missing or wrong.
-            let etag = response.header("ETag").ok_or_else(|| {
+            let etag = etag_of(&response).ok_or_else(|| {
                 MoonclipError::Storage(format!("S3 part {number} came back without an ETag"))
             })?;
             let _ = write!(
@@ -705,7 +701,8 @@ impl S3Storage {
         // status code alone is not the answer here — it is the one place in
         // this module where a success code can mean a failed request.
         let body = response
-            .into_string()
+            .into_body()
+            .read_to_string()
             .map_err(|e| MoonclipError::Storage(format!("S3 multipart complete: {e}")))?;
         if body.contains("<Error>") {
             let code = extract_xml_value(&body, "Code").unwrap_or_else(|| "unknown".into());
@@ -737,7 +734,7 @@ impl S3Storage {
         loop {
             attempt += 1;
             let url = self.signed_url("GET", key, &[])?;
-            match self.agent.get(url.as_str()).set("Range", &range).call() {
+            match answered(key, self.agent.get(url.as_str()).header("Range", &range).call()) {
                 Ok(resp) => {
                     // A server is allowed to ignore `Range` and answer 200 with
                     // the whole object. Truncating that to `len` would hand
@@ -746,7 +743,7 @@ impl S3Storage {
                     // the header, or a tensor blob that is somebody else's.
                     // Wrong bytes are worse than no bytes, so this is an error
                     // unless the window happens to start at 0 anyway.
-                    if resp.status() != 206 && offset != 0 {
+                    if resp.status().as_u16() != 206 && offset != 0 {
                         return Err(MoonclipError::Storage(format!(
                             "S3 answered {} for a ranged read of {key}: the endpoint ignored \
                              Range, so bytes {}..{} cannot be read a piece at a time",
@@ -758,14 +755,13 @@ impl S3Storage {
                     let mut buf = Vec::with_capacity(len);
                     // Bounded by `len` rather than by what the far side sends,
                     // so an over-long body cannot balloon the read.
-                    let mut reader = resp.into_reader().take(len as u64);
+                    let mut reader = resp.into_body().into_reader().take(len as u64);
                     reader
                         .read_to_end(&mut buf)
                         .map_err(|e| MoonclipError::Storage(format!("S3 read error: {e}")))?;
                     return Ok(buf);
                 }
-                Err(e) => {
-                    let err = status_error(key, e);
+                Err(err) => {
                     if attempt < MAX_ATTEMPTS && is_retryable(&err) {
                         std::thread::sleep(backoff);
                         backoff *= 2;
@@ -790,15 +786,30 @@ const MAX_ATTEMPTS: u32 = 3;
 /// later. Callers used to look for the substring "404" in the error text,
 /// which also matched any object whose *key* contained those digits — a step
 /// number, a shard id — and reported a real failure as a missing object.
-fn status_error(key: &str, e: ureq::Error) -> MoonclipError {
-    match e {
-        ureq::Error::Status(404, _) => MoonclipError::NotFound(key.to_string()),
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            MoonclipError::Storage(format!("S3 HTTP {code}: {body}"))
+///
+/// The agent answers every status itself (`http_status_as_error(false)`), so
+/// any `ureq::Error` is the request not getting an answer: transport.
+fn answered(
+    key: &str,
+    answer: std::result::Result<Answer, ureq::Error>,
+) -> std::result::Result<Answer, MoonclipError> {
+    let mut response =
+        answer.map_err(|e| MoonclipError::Storage(format!("S3 transport error: {e}")))?;
+    match response.status().as_u16() {
+        404 => Err(MoonclipError::NotFound(key.to_string())),
+        code if code >= 400 => {
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            Err(MoonclipError::Storage(format!("S3 HTTP {code}: {body}")))
         }
-        ureq::Error::Transport(t) => MoonclipError::Storage(format!("S3 transport error: {t}")),
+        _ => Ok(response),
     }
+}
+
+/// A response as ureq 3 gives it: the `http` crate's, with ureq's body.
+type Answer = ureq::http::Response<ureq::Body>;
+
+fn etag_of(response: &Answer) -> Option<&str> {
+    response.headers().get("ETag").and_then(|value| value.to_str().ok())
 }
 
 /// Whether this failure is worth another attempt.
@@ -836,8 +847,11 @@ impl StorageBackend for S3Storage {
             other => other,
         })?;
 
+        use std::io::Read;
+
         let mut buf = Vec::new();
-        resp.into_reader()
+        resp.into_body()
+            .into_reader()
             .read_to_end(&mut buf)
             .map_err(|e| MoonclipError::Storage(format!("S3 read error: {e}")))?;
         Ok(buf)
@@ -891,7 +905,8 @@ impl StorageBackend for S3Storage {
             let resp = self.do_request("GET", "", None, &params)?;
 
             let body = resp
-                .into_string()
+                .into_body()
+                .read_to_string()
                 .map_err(|e| MoonclipError::Storage(format!("S3 list parse error: {e}")))?;
 
             // Parse XML response (minimal, no full XML parser needed)

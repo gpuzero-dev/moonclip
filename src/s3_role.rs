@@ -96,10 +96,13 @@ impl std::fmt::Debug for RoleCredentials {
 
 impl RoleCredentials {
     pub fn new(source: RoleSource) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(METADATA_TIMEOUT)
-            .timeout(Duration::from_secs(10))
-            .build();
+        let agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(METADATA_TIMEOUT))
+            .timeout_global(Some(Duration::from_secs(10)))
+            // A refusal is read in `answered`, body included.
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
         RoleCredentials { source, agent, current: Mutex::new(None), again_after: AGAIN_AFTER }
     }
 
@@ -140,19 +143,17 @@ impl RoleCredentials {
                         "AWS_WEB_IDENTITY_TOKEN_FILE {token_file:?} could not be read: {e}"
                     ))
                 })?;
-                let response = self
-                    .agent
-                    .get(sts)
-                    .query("Action", "AssumeRoleWithWebIdentity")
-                    .query("Version", "2011-06-15")
-                    .query("RoleArn", role_arn)
-                    .query("RoleSessionName", session_name)
-                    .query("WebIdentityToken", token.trim())
-                    .call()
-                    .map_err(|e| failed("STS AssumeRoleWithWebIdentity", e))?;
-                let body = response
-                    .into_string()
-                    .map_err(|e| MoonclipError::Storage(format!("STS answer: {e}")))?;
+                let body = answered(
+                    "STS AssumeRoleWithWebIdentity",
+                    self.agent
+                        .get(sts)
+                        .query("Action", "AssumeRoleWithWebIdentity")
+                        .query("Version", "2011-06-15")
+                        .query("RoleArn", role_arn)
+                        .query("RoleSessionName", session_name)
+                        .query("WebIdentityToken", token.trim())
+                        .call(),
+                )?;
                 let value = |name: &str| crate::s3::extract_xml_value(&body, name);
                 match (value("AccessKeyId"), value("SecretAccessKey"), value("SessionToken")) {
                     (Some(access_key), Some(secret_key), Some(token)) => Ok((
@@ -178,33 +179,28 @@ impl RoleCredentials {
                             .trim()
                             .to_string(),
                     };
-                    request = request.set("Authorization", &value);
+                    request = request.header("Authorization", &value);
                 }
-                let body = request
-                    .call()
-                    .map_err(|e| failed("the container's credentials endpoint", e))?
-                    .into_string()
-                    .map_err(|e| MoonclipError::Storage(format!("container credentials: {e}")))?;
+                let body = answered("the container's credentials endpoint", request.call())?;
                 from_json(&body, "the container's credentials endpoint")
             }
             RoleSource::Instance { endpoint } => {
                 let base = endpoint.trim_end_matches('/');
-                let session = self
-                    .agent
-                    .put(&format!("{base}/latest/api/token"))
-                    .set("X-aws-ec2-metadata-token-ttl-seconds", "21600")
-                    .call()
-                    .map_err(|e| failed("the instance metadata service (IMDSv2 token)", e))?
-                    .into_string()
-                    .map_err(|e| MoonclipError::Storage(format!("IMDSv2 token: {e}")))?;
-                let read = |path: &str| -> Result<String> {
+                let session = answered(
+                    "the instance metadata service (IMDSv2 token)",
                     self.agent
-                        .get(&format!("{base}{path}"))
-                        .set("X-aws-ec2-metadata-token", session.trim())
-                        .call()
-                        .map_err(|e| failed("the instance metadata service", e))?
-                        .into_string()
-                        .map_err(|e| MoonclipError::Storage(format!("instance metadata: {e}")))
+                        .put(&format!("{base}/latest/api/token"))
+                        .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+                        .send_empty(),
+                )?;
+                let read = |path: &str| -> Result<String> {
+                    answered(
+                        "the instance metadata service",
+                        self.agent
+                            .get(&format!("{base}{path}"))
+                            .header("X-aws-ec2-metadata-token", session.trim())
+                            .call(),
+                    )
                 };
                 let roles = read("/latest/meta-data/iam/security-credentials/")?;
                 let role = roles.lines().map(str::trim).find(|line| !line.is_empty()).ok_or_else(|| {
@@ -315,19 +311,25 @@ fn expiration(at: &str) -> Option<SystemTime> {
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(u64::try_from(at.as_second()).ok()?))
 }
 
-fn failed(what: &str, e: ureq::Error) -> MoonclipError {
-    match e {
-        ureq::Error::Status(code, response) => {
-            let body = response.into_string().unwrap_or_default();
-            let body = body.trim();
-            if body.is_empty() {
-                MoonclipError::Storage(format!("{what} answered {code}"))
-            } else {
-                MoonclipError::Storage(format!("{what} answered {code}: {body}"))
-            }
-        }
-        ureq::Error::Transport(t) => MoonclipError::Storage(format!("{what} did not answer: {t}")),
+/// The body of a successful answer from `what`, or why there is none. The
+/// agent answers every status itself, so a `ureq::Error` is no answer at all.
+fn answered(
+    what: &str,
+    answer: std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<String> {
+    let mut response = answer.map_err(|e| MoonclipError::Storage(format!("{what} did not answer: {e}")))?;
+    let code = response.status().as_u16();
+    let body = response.body_mut().read_to_string();
+    if code >= 400 {
+        let body = body.unwrap_or_default();
+        let body = body.trim();
+        return Err(MoonclipError::Storage(if body.is_empty() {
+            format!("{what} answered {code}")
+        } else {
+            format!("{what} answered {code}: {body}")
+        }));
     }
+    body.map_err(|e| MoonclipError::Storage(format!("{what}: the answer could not be read: {e}")))
 }
 
 #[cfg(test)]
