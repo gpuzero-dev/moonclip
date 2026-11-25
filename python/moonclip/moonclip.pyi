@@ -385,7 +385,9 @@ class MoonclipManager:
 
     def list_snapshots(self) -> List[Dict[str, Any]]:
         """
-        List all finalized snapshots.
+        List the snapshots written so far, without waiting for a save in
+        flight: it is in the next listing, never half in this one. Call
+        `flush()` first for the save just made (GPU-517).
 
         Returns:
             List of snapshot info dicts containing details such as step, id,

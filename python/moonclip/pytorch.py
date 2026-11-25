@@ -990,7 +990,8 @@ class CheckpointManager:
         flush() when you need the checkpoint durably on disk — the data is
         fsynced before the file is renamed into place, so it survives a power
         cut, unless MOONCLIP_FSYNC=0 (e.g. right
-        before exiting). Loads and list_snapshots() flush automatically.
+        before exiting). Loads flush automatically; list_snapshots() lists
+        what is written and does not wait for a save in flight (GPU-517).
         """
         self._mgr.flush()
 
@@ -1045,6 +1046,9 @@ class CheckpointManager:
             total_raw_bytes, total_compressed_bytes, compression_ratio,
             estimated_naive_bytes, total_saved_bytes, savings_percent
         """
+        # Every save made so far, the one in flight included: the listing
+        # does not wait for it (GPU-517), and these are totals.
+        self.flush()
         snaps = self.list_snapshots()
         if not snaps:
             return {"total_snapshots": 0}

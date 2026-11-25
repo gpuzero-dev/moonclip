@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1 — unreleased
+
+### Changed
+
+- **Listing the snapshots no longer waits for a save in flight (GPU-517).**
+  `list_snapshots()` returns what is written: a snapshot enters the manifest
+  only once all of it is on disk, so the save still going is simply not in
+  the list yet. It used to wait for that save, and a caller listing at a
+  checkpoint waited for the checkpoint's own write - for Ravex sending the
+  platform its list, the 80 s of a 9.5 GB full, with training stopped behind
+  it. Call `flush()` first to include the save just made;
+  `CheckpointManager.stats()` does.
+
 ## 0.4.0 — 2026-11-25
 
 ### Added

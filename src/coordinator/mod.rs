@@ -595,9 +595,17 @@ impl Coordinator {
         self.core.load_tensors(snap_id, names)
     }
 
-    /// List all snapshots.
+    /// List the snapshots written so far, without waiting for the one in flight.
+    ///
+    /// A snapshot enters the manifest only once all of it is on disk, so the
+    /// list never names one half written; a save still going is simply not in
+    /// it yet, and will be in the next. It used to wait for that save first,
+    /// and a caller listing at a checkpoint - Ravex, sending the platform its
+    /// list - waited for the checkpoint's own write: on deepseek-1b the 80 s of
+    /// a 9.5 GB full, with the training loop stopped behind it (GPU-517). A
+    /// caller that needs the save it just made in the list calls
+    /// [`flush`](Self::flush) first.
     pub fn list_snapshots(&self) -> Vec<SnapshotInfo> {
-        self.wait_idle();
         self.core.list_snapshots()
     }
 

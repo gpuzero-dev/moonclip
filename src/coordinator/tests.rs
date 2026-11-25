@@ -156,6 +156,7 @@ fn retention_caps_total_snapshots() {
         }], HashMap::new()).unwrap();
     }
 
+    coord.flush().unwrap();
     let snaps = coord.list_snapshots();
     assert!(
         snaps.len() <= 5,
@@ -190,6 +191,7 @@ fn retention_policy_removes_old_snapshots() {
         }], HashMap::new()).unwrap();
     }
 
+    coord.flush().unwrap();
     let snaps = coord.list_snapshots();
     let full_count = snaps.iter().filter(|s| !s.is_delta).count();
     assert!(
@@ -293,6 +295,7 @@ fn a_store_opened_again_follows_the_new_retention() {
     for step in 1..=3 {
         save(&window, step);
     }
+    window.flush().unwrap();
     assert_eq!(window.list_snapshots().iter().filter(|s| s.is_delta).count(), 2);
     drop(window);
 
@@ -306,6 +309,7 @@ fn a_store_opened_again_follows_the_new_retention() {
     for step in [5, 10] {
         save(&fulls, step);
     }
+    fulls.flush().unwrap();
     let kept: Vec<(u64, bool)> = fulls.list_snapshots().iter().map(|s| (s.step, s.is_delta)).collect();
     assert_eq!(kept, vec![(5, false), (10, false)]);
 }
@@ -339,6 +343,7 @@ fn force_full_after_n_steps() {
         }], HashMap::new()).unwrap();
     }
 
+    coord.flush().unwrap();
     let snaps = coord.list_snapshots();
     let full_count = snaps.iter().filter(|s| !s.is_delta).count();
     assert!(full_count >= 3, "Expected >=3 full snapshots, got {full_count}");
@@ -364,6 +369,7 @@ fn metadata_preserved() {
 
     coord.save(100, sample_tensors(0), meta).unwrap();
 
+    coord.flush().unwrap();
     let snaps = coord.list_snapshots();
     assert_eq!(snaps[0].metadata["loss"], "0.123");
     assert_eq!(snaps[0].metadata["lr"], "3e-4");
@@ -3465,4 +3471,27 @@ fn a_window_store_opened_again_goes_on_where_it_was() {
     // The last checkpoint, and whatever the cadence took after it: not
     // necessarily step 75, under a machine busy enough to space the saves.
     assert!(steps.contains(&70) && *steps.last().unwrap() >= 70, "{steps:?}");
+}
+
+/// GPU-517: listing does not wait for the save in flight. The list made while
+/// a large save is still being written names what was already on disk and
+/// not that save, never half of it; after `flush` it is there.
+#[test]
+fn listing_does_not_wait_for_the_save_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = make_coordinator(dir.path());
+    coord.save(1, sample_tensors(1), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+
+    // 256 MiB that do not compress: long enough to write that the listing
+    // below runs while it is going.
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let big: Vec<u8> = (0..256usize << 20).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
+    coord.save(2, vec![TensorData { name: "w".into(), shape: vec![big.len()], dtype: "uint8".into(), data: big }], HashMap::new()).unwrap();
+    let listed: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
+    assert_eq!(listed, vec![1], "the listing waited for the save in flight");
+
+    coord.flush().unwrap();
+    let listed: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
+    assert_eq!(listed, vec![1, 2]);
 }
