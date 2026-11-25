@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+### Added
+
+- **The store chooses how often to save between two checkpoints
+  (GPU-517).** `MoonclipManager(window_steps=N)` with `wants(step)` asked
+  at every step: a checkpoint, every `N` steps, is always taken, and
+  between two the store saves as often as what saving costs leaves room
+  for. At each checkpoint the window that just closed says how much of its
+  wall clock went into the shadow copy and the writer, or into the upload
+  if that was longer, and the gap between saves moves so that this is half
+  the window - down to a save at every step, up to one per checkpoint, at
+  most twice as far per window after the first. It starts at one per
+  checkpoint. The first delta is weighed against its base: under half,
+  deltas go on and the next save is a full held in memory as their base;
+  at half or more the store saves fulls, and holds no base. A window holds
+  at most `max_full_snapshots` fulls' worth of bytes, however cheap its
+  saves: on a fast disk and link a state saved in fulls otherwise came down
+  to a full every step. Retention keeps the last `N` steps by age and the
+  two newest fulls, and the sync runs at each checkpoint.
+  `cadence()` says the gap as it stands. Until now the caller decided all
+  of this from outside, by reading the store's snapshots and
+  `remote_step()`.
+
 ## 0.3.9 — 2026-11-23
 
 ### Changed

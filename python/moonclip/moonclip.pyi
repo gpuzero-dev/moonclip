@@ -37,6 +37,7 @@ class MoonclipManager:
         async_save: bool = True,
         keep_base_in_memory: bool = True,
         s3_session_token: Optional[str] = None,
+        window_steps: Optional[int] = None,
     ) -> None:
         """
         Initialize the MoonclipManager.
@@ -144,7 +145,19 @@ class MoonclipManager:
                 which come with one beside the access key and the secret.
                 Read from the environment with keys read from there
                 (MOONCLIP_S3_SESSION_TOKEN or AWS_SESSION_TOKEN).
-                Last, so no earlier argument moves.
+            window_steps: Let the store choose how often to save between two
+                checkpoints, every this many steps (GPU-517). Offer it every
+                step through `wants()`: a checkpoint is always taken, and
+                between two as often as the copy, the write and the upload
+                leave room for, starting at none and coming down from there.
+                Deltas while the first one weighs under half its base, fulls
+                after that; the base is held in memory only once deltas pay.
+                The store keeps the last `window_steps` steps by age and the
+                fulls they need, whatever the counts above say, and syncs at
+                each checkpoint instead of every `sync_every_n_saves`. There
+                `max_full_snapshots` is the most a window may hold, in fulls'
+                worth of bytes: no faster than that, however cheap.
+                Single-rank stores only.
         """
         ...
 
@@ -199,6 +212,20 @@ class MoonclipManager:
         keeps up with what is written (GPU-418): a periodic sync puts up the
         newest point first, and a link slower than the saves leaves this
         further behind at every sync.
+        """
+        ...
+    def wants(self, step: int) -> bool:
+        """
+        Whether to save `step`, in a store opened with `window_steps`
+        (GPU-517). Ask for every step, checkpoints included - a checkpoint
+        closes the window the store times - and save the ones it says yes to.
+        Always True without a window. No I/O and no wait.
+        """
+        ...
+    def cadence(self) -> Optional[int]:
+        """
+        Steps between two saves inside a window as the store last chose, or
+        None without a window (GPU-517).
         """
         ...
     def remote_steps(self) -> Optional[List[int]]:

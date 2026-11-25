@@ -365,6 +365,7 @@ impl MoonclipManager {
         async_save = true,
         keep_base_in_memory = true,
         s3_session_token = None,
+        window_steps = None,
     ))]
     fn new(
         storage_root: &str,
@@ -392,6 +393,7 @@ impl MoonclipManager {
         async_save: bool,
         keep_base_in_memory: bool,
         s3_session_token: Option<&str>,
+        window_steps: Option<u64>,
     ) -> PyResult<Self> {
         let compression = if compression_level == 0 {
             CompressionAlgo::None
@@ -410,6 +412,7 @@ impl MoonclipManager {
                 max_deltas_per_full,
                 full_snapshot_every_steps: full_every_steps,
                 max_total_snapshots,
+                window_steps,
             },
             lineage: LineageConfig {
                 rollback_interval_steps,
@@ -499,7 +502,9 @@ impl MoonclipManager {
         // (see `crate::pool`) — the save pipeline installs it again downstream,
         // but this copy happens on the calling thread, before any of that.
         let id = py.detach(|| {
+            let copying = std::time::Instant::now();
             let tensor_data = crate::pool::install(move || materialize_tensors(pending));
+            self.inner.spent_copying(copying.elapsed());
             // `save` stays outside the pool. It blocks until the previous save
             // drains, and a blocked pool worker is a worker the pool has lost
             // — one that can be holding a stolen piece of the very
@@ -536,6 +541,19 @@ impl MoonclipManager {
     /// (GPU-422): the points a resume or a fork from the remote can start at.
     fn remote_steps(&self) -> Option<Vec<u64>> {
         self.inner.remote_steps()
+    }
+
+    /// Whether to save `step`, in a store opened with `window_steps`
+    /// (GPU-517): ask for every step, checkpoints included, and save the ones
+    /// it says yes to. Always True without a window. Cheap: no I/O, no wait.
+    fn wants(&self, step: u64) -> bool {
+        self.inner.wants(step)
+    }
+
+    /// Steps between two saves inside a window as the store last chose,
+    /// or None without a window (GPU-517).
+    fn cadence(&self) -> Option<u64> {
+        self.inner.cadence()
     }
 
     /// Create a new snapshot (multi-rank: rank 0 only).

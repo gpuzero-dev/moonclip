@@ -232,6 +232,9 @@ pub(crate) struct Core {
     pending_deletes: Arc<PendingDeletes>,
     /// See [`CoordinatorConfig::keep_base_in_memory`].
     retained_base: Mutex<Option<RetainedBase>>,
+    /// How often to save between checkpoints, with
+    /// [`RetentionPolicy::window_steps`] set (GPU-517). See [`crate::cadence`].
+    cadence: Option<crate::cadence::Cadence>,
     /// Whether the `save_dtype` patterns have already been checked against a
     /// real set of tensor names. Once per process: the answer cannot change
     /// between steps, and a run checkpointing every hundred steps would
@@ -267,6 +270,23 @@ impl Coordinator {
                 "max_full_snapshots is 0, which keeps no checkpoint at all;                  keep at least 1, or a large number for no limit in practice"
                     .into(),
             ));
+        }
+        let mut config = config;
+        if let Some(window) = config.retention.window_steps {
+            // The writer's time is measured on the single-rank save path; a
+            // multi-rank store would choose its cadence from nothing.
+            if config.world_size != 1 || window == 0 {
+                return Err(MoonclipError::Config(
+                    "window_steps needs a single-rank store and a window of at least one step"
+                        .into(),
+                ));
+            }
+            // The upload goes at each checkpoint (see `Core::save_sync_in_pool`),
+            // not every so many saves: their number per window is the cadence's
+            // to change.
+            if let Some(sync) = config.remote_sync.as_mut() {
+                sync.sync_every_n_saves = 0;
+            }
         }
         let manifest = load_manifest(storage.as_ref(), &config)?;
 
@@ -333,6 +353,10 @@ impl Coordinator {
         };
 
         let use_async = config.async_save && config.world_size == 1;
+        // With a window the count of fulls is no cap but the most a window
+        // may hold, in fulls' worth of bytes (GPU-517).
+        let fulls = config.retention.max_full_snapshots as u64;
+        let cadence = config.retention.window_steps.map(|w| crate::cadence::Cadence::new(w, fulls));
 
         let core = Arc::new(Core {
             storage,
@@ -343,6 +367,7 @@ impl Coordinator {
             in_flight,
             pending_deletes,
             retained_base: Mutex::new(None),
+            cadence,
             dtype_patterns_checked: AtomicBool::new(false),
             manifest_stale: AtomicBool::new(false),
         });
@@ -424,6 +449,35 @@ impl Coordinator {
     /// (GPU-422). See [`RemoteSyncer::remote_steps`].
     pub fn remote_steps(&self) -> Option<Vec<u64>> {
         self.core.syncer.as_ref().and_then(|syncer| syncer.remote_steps())
+    }
+
+    /// Whether to save `step`, with [`RetentionPolicy::window_steps`] set
+    /// (GPU-517): ask for every step, checkpoints included, and save the ones
+    /// it says yes to. Always yes without a window, where the caller decides.
+    /// See [`crate::cadence`].
+    pub fn wants(&self, step: u64) -> bool {
+        match self.core.cadence {
+            Some(ref cadence) => {
+                let upload = self.core.syncer.as_ref().and_then(|s| s.upload_time());
+                cadence.wants(step, upload)
+            }
+            None => true,
+        }
+    }
+
+    /// The caller spent `took` copying the state it is about to hand to
+    /// [`save`](Self::save); counted by the cadence with the write (GPU-517).
+    /// Nothing without a window.
+    pub fn spent_copying(&self, took: Duration) {
+        if let Some(ref cadence) = self.core.cadence {
+            cadence.copied(took);
+        }
+    }
+
+    /// Steps between two saves inside a window as the cadence stands, or
+    /// `None` without a window (GPU-517).
+    pub fn cadence(&self) -> Option<u64> {
+        self.core.cadence.as_ref().map(|c| c.every())
     }
 
     pub fn last_queue_wait(&self) -> Duration {
@@ -744,8 +798,12 @@ impl Core {
         // merge has already claimed is not picked up at all — this save writes
         // a full snapshot instead, which costs bytes for one step and cannot
         // end up as a delta against something that no longer exists.
+        if let Some(ref cadence) = self.cadence {
+            cadence.writing(save_started);
+        }
         let manifest = self.lock_manifest();
-        let force_full = manifest.should_force_full(step);
+        let force_full = manifest.should_force_full(step)
+            || self.cadence.as_ref().is_some_and(|c| c.wants_full());
         let base_snap = if force_full {
             None
         } else {
@@ -765,8 +823,17 @@ impl Core {
             created_at,
             metadata: metadata.clone(),
         };
-        let rank_entry =
-            self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors, &context)?;
+        let written = self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors, &context);
+        if let Some(ref cadence) = self.cadence {
+            cadence.written(Instant::now());
+        }
+        let rank_entry = written?;
+        if let Some(ref cadence) = self.cadence {
+            match base_snap.as_ref().and_then(|b| b.ranks.get(&self.config.rank)) {
+                Some(base) => cadence.delta_written(rank_entry.total_compressed, base.total_compressed),
+                None => cadence.full_written(rank_entry.total_compressed),
+            }
+        }
 
         let snapshot = Snapshot {
             pinned: false,
@@ -817,9 +884,14 @@ impl Core {
             merger.notify();
         }
 
-        // Notify remote syncer
+        // Notify remote syncer. With a window, at each checkpoint instead
+        // (GPU-517): how many saves a window holds is the cadence's to change.
         if let Some(ref syncer) = self.syncer {
-            syncer.notify_save();
+            match self.config.retention.window_steps {
+                Some(window) if step % window == 0 => syncer.checkpoint(),
+                Some(_) => {}
+                None => syncer.notify_save(),
+            }
         }
 
         crate::profile::report(
@@ -1762,9 +1834,12 @@ impl Core {
         }
         // Kept only when a delta can ever follow: under a full at every step
         // the copy would be held after every save and read by nothing.
+        // With a cadence, only once a delta has been found to pay: before,
+        // the copy may be held for deltas that never come (GPU-517).
         let retain = base_snap.is_none()
             && self.config.keep_base_in_memory
-            && self.lock_manifest().retention.allows_deltas();
+            && self.lock_manifest().retention.allows_deltas()
+            && self.cadence.as_ref().is_none_or(|c| c.keeps_base());
 
         let mut tensors = tensors;
         self.check_dtype_patterns(&tensors);
@@ -2104,6 +2179,53 @@ impl Core {
         // different question - see `Manifest::protected_snapshot_ids`.
         let rollback_ids = manifest.protected_snapshot_ids();
         let mut evicted: Vec<Snapshot> = Vec::new();
+
+        // ── With a window: by age, not by count (GPU-517) ────────────
+        //
+        // Everything from `window` steps before the newest on, and what it
+        // needs: the oldest step older than that goes first, as in pass 2,
+        // and only once nothing points at it. The counts do not apply: how
+        // many saves a window holds is the cadence's, and changes.
+        //
+        // And the two newest fulls, wherever they are. Every newer delta is
+        // read through the newest, so if it will not read the one before is
+        // the only way back short of starting over (GPU-241); by age alone a
+        // window with one full in it dropped the other.
+        if let Some(window) = manifest.retention.window_steps {
+            // The newest is never a candidate, so it holds through the loop.
+            let newest = manifest.snapshots.iter().filter(|s| s.finalized).map(|s| s.step).max();
+            let oldest_kept = newest.unwrap_or(0).saturating_sub(window);
+            let fallback: Vec<Uuid> = manifest
+                .snapshots
+                .iter()
+                .rev()
+                .filter(|s| s.finalized && s.base_snapshot_id.is_none())
+                .take(2)
+                .map(|s| s.id)
+                .collect();
+            let removable = |manifest: &Manifest| {
+                manifest
+                    .snapshots
+                    .iter()
+                    .find(|s| {
+                        s.finalized
+                            && s.step < oldest_kept
+                            && !fallback.contains(&s.id)
+                            && !rollback_ids.contains(&s.id)
+                            && (s.base_snapshot_id.is_some()
+                                || !manifest
+                                    .snapshots
+                                    .iter()
+                                    .any(|d| d.base_snapshot_id == Some(s.id)))
+                    })
+                    .map(|s| s.id)
+            };
+            while let Some(id) = removable(manifest) {
+                evicted.extend(self.remove_snapshots(manifest, &[id])?);
+            }
+            self.persist_manifest(manifest)?;
+            return Ok(evicted);
+        }
 
         // ── Pass 1: Cap full snapshot count ──────────────────────────
         // Loop until we're within the full-snapshot limit.

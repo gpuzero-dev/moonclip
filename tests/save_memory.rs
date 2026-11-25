@@ -131,6 +131,7 @@ fn coordinator(dir: &std::path::Path, full_every: u64, keep_base: bool) -> Coord
                 max_deltas_per_full: 1000,
                 full_snapshot_every_steps: full_every,
                 max_total_snapshots: Some(10),
+                window_steps: None,
             },
             async_save: true,
             keep_base_in_memory: keep_base,

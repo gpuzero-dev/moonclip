@@ -21,6 +21,7 @@ fn make_coordinator(dir: &std::path::Path) -> Coordinator {
             max_deltas_per_full: 10,
             full_snapshot_every_steps: 10000,
             max_total_snapshots: None,
+            window_steps: None,
         },
         delta_max_ratio: 0.95,
         ..Default::default()
@@ -141,6 +142,7 @@ fn retention_caps_total_snapshots() {
             max_deltas_per_full: 5,
             full_snapshot_every_steps: 5, // full every 5 steps
             max_total_snapshots: Some(4), // hard cap at 4
+            window_steps: None,
         },
         delta_max_ratio: 0.95,
         ..Default::default()
@@ -175,6 +177,7 @@ fn retention_policy_removes_old_snapshots() {
             max_deltas_per_full: 5,
             full_snapshot_every_steps: 1, // force full every step
             max_total_snapshots: None,
+            window_steps: None,
         },
         delta_max_ratio: 0.95,
         ..Default::default()
@@ -285,6 +288,7 @@ fn a_store_opened_again_follows_the_new_retention() {
         max_deltas_per_full: 100,
         full_snapshot_every_steps: 100,
         max_total_snapshots: Some(6),
+        window_steps: None,
     });
     for step in 1..=3 {
         save(&window, step);
@@ -297,6 +301,7 @@ fn a_store_opened_again_follows_the_new_retention() {
         max_deltas_per_full: 100,
         full_snapshot_every_steps: 1,
         max_total_snapshots: Some(2),
+        window_steps: None,
     });
     for step in [5, 10] {
         save(&fulls, step);
@@ -318,6 +323,7 @@ fn force_full_after_n_steps() {
             max_deltas_per_full: 100,
             full_snapshot_every_steps: 3,
             max_total_snapshots: None,
+            window_steps: None,
         },
         delta_max_ratio: 0.95,
         ..Default::default()
@@ -395,6 +401,7 @@ fn concurrent_saves_all_land() {
                 max_deltas_per_full: 1000,
                 full_snapshot_every_steps: 100_000,
                 max_total_snapshots: None,
+                window_steps: None,
             },
             delta_max_ratio: 0.95,
             ..Default::default()
@@ -1012,6 +1019,7 @@ fn the_total_cap_trims_the_history_instead_of_erasing_it() {
                 // against it: what a training run actually looks like.
                 full_snapshot_every_steps: 5000,
                 max_total_snapshots: Some(2),
+                window_steps: None,
             },
             ..Default::default()
         },
@@ -1060,6 +1068,7 @@ fn the_total_cap_still_prunes_a_history_of_fulls() {
                 max_deltas_per_full: 10,
                 full_snapshot_every_steps: 1, // every save is a full
                 max_total_snapshots: Some(2),
+                window_steps: None,
             },
             ..Default::default()
         },
@@ -1095,6 +1104,7 @@ fn a_cap_of_one_keeps_the_newest_step() {
                 max_deltas_per_full: 10,
                 full_snapshot_every_steps: 5000,
                 max_total_snapshots: Some(1),
+                window_steps: None,
             },
             ..Default::default()
         },
@@ -1134,6 +1144,7 @@ fn a_cap_does_not_prefer_a_new_delta_over_an_old_full() {
                 max_deltas_per_full: 10,
                 full_snapshot_every_steps: 3, // fulls at 1 and 4
                 max_total_snapshots: Some(2),
+                window_steps: None,
             },
             ..Default::default()
         },
@@ -1174,6 +1185,7 @@ fn every_snapshot_left_after_retention_still_loads() {
             max_deltas_per_full: 5,
             full_snapshot_every_steps: 3,
             max_total_snapshots: Some(6),
+            window_steps: None,
         },
         delta_max_ratio: 0.95,
         ..Default::default()
@@ -1317,6 +1329,7 @@ fn a_pinned_snapshot_survives_the_tightest_cap() {
             max_deltas_per_full: 2,
             full_snapshot_every_steps: 0,
             max_total_snapshots: Some(1),
+            window_steps: None,
         },
         lineage: LineageConfig {
             rollback_interval_steps: 0,
@@ -1366,6 +1379,7 @@ fn unpinning_lets_retention_have_it_again() {
             max_deltas_per_full: 2,
             full_snapshot_every_steps: 0,
             max_total_snapshots: Some(1),
+            window_steps: None,
         },
         lineage: LineageConfig {
             rollback_interval_steps: 0,
@@ -1469,6 +1483,7 @@ fn rollback_snapshots_survive_the_retention_cap() {
             max_deltas_per_full: 2,
             full_snapshot_every_steps: 2,
             max_total_snapshots: Some(3),
+            window_steps: None,
         },
         lineage: LineageConfig {
             rollback_interval_steps: 4,
@@ -1522,6 +1537,7 @@ fn only_the_newest_rollback_snapshots_stay_protected() {
             max_deltas_per_full: 2,
             full_snapshot_every_steps: 2,
             max_total_snapshots: Some(3),
+            window_steps: None,
         },
         lineage: LineageConfig {
             rollback_interval_steps: 4,
@@ -1731,6 +1747,7 @@ fn a_merge_does_not_delete_the_base_a_save_is_reading() {
             max_deltas_per_full: 10,
             full_snapshot_every_steps: 10000,
             max_total_snapshots: None,
+            window_steps: None,
         },
         delta_max_ratio: 0.95,
         // Synchronous, and with the base off storage rather than out of
@@ -2102,6 +2119,7 @@ fn a_dead_background_thread_is_reported_by_flush() {
         in_flight: Arc::new(crate::inflight::InFlight::default()),
         pending_deletes: Arc::new(PendingDeletes::default()),
         retained_base: Mutex::new(None),
+        cadence: None,
         dtype_patterns_checked: AtomicBool::new(false),
         manifest_stale: AtomicBool::new(false),
     });
@@ -2621,6 +2639,7 @@ fn a_pin_from_another_process_survives_this_ones_saves() {
             max_deltas_per_full: 2,
             full_snapshot_every_steps: 0,
             max_total_snapshots: Some(2),
+            window_steps: None,
         },
         lineage: LineageConfig {
             rollback_interval_steps: 0,
@@ -2921,6 +2940,7 @@ fn keeping_everything(storage: Arc<dyn StorageBackend>, full_every: u64) -> Coor
                 max_deltas_per_full: 10_000,
                 full_snapshot_every_steps: full_every,
                 max_total_snapshots: None,
+                window_steps: None,
             },
             delta_max_ratio: 0.95,
             ..Default::default()
@@ -3105,6 +3125,7 @@ fn retention_leaves_no_snapshot_directory_behind() {
                 max_deltas_per_full: 1000,
                 full_snapshot_every_steps: 1000,
                 max_total_snapshots: Some(3),
+                window_steps: None,
             },
             delta_max_ratio: 0.95,
             ..Default::default()
@@ -3226,6 +3247,7 @@ fn a_remote_slower_than_the_saves_always_holds_a_checkpoint_it_can_load() {
             max_deltas_per_full: 1000,
             full_snapshot_every_steps: 1000,
             max_total_snapshots: Some(5),
+            window_steps: None,
         },
         remote_storage: Some(Arc::clone(&remote)),
         remote_sync: Some(crate::remote_sync::RemoteSyncConfig {
@@ -3303,4 +3325,144 @@ fn the_remote_step_follows_what_the_syncs_put_up() {
     let mut here: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
     here.sort();
     assert_eq!(all, here);
+}
+
+/// A store with a window, offered every step the way a training loop offers
+/// them: `data` gives each step's bytes, one step takes `step_time`.
+fn offer_window(
+    dir: &std::path::Path,
+    window: u64,
+    steps: std::ops::RangeInclusive<u64>,
+    step_time: Duration,
+    data: impl Fn(u64) -> Vec<u8>,
+) -> (Coordinator, Vec<u64>) {
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir).unwrap());
+    let coord = Coordinator::new(storage, CoordinatorConfig {
+        compression: CompressionAlgo::Zstd { level: 1 },
+        retention: RetentionPolicy {
+            full_snapshot_every_steps: 10_000,
+            max_deltas_per_full: 10_000,
+            window_steps: Some(window),
+            ..Default::default()
+        },
+        ..Default::default()
+    }).unwrap();
+    let mut saved = Vec::new();
+    for step in steps {
+        thread::sleep(step_time);
+        if coord.wants(step) {
+            saved.push(step);
+            let bytes = data(step);
+            coord.save(step, vec![TensorData {
+                name: "w".into(), shape: vec![bytes.len()], dtype: "uint8".into(), data: bytes,
+            }], HashMap::new()).unwrap();
+        }
+    }
+    coord.flush().unwrap();
+    (coord, saved)
+}
+
+/// GPU-517: cheap saves come down from one per checkpoint to many between
+/// them, the first delta is found to pay and rebased, and retention keeps
+/// the window by age - whatever the count - and the base it needs.
+#[test]
+fn a_window_of_cheap_saves_takes_many_and_keeps_the_last_window() {
+    let dir = tempfile::tempdir().unwrap();
+    // Incompressible bytes of which one changes a step: a full weighs the
+    // whole tensor, a delta next to nothing.
+    let (coord, saved) = offer_window(dir.path(), 10, 1..=60, Duration::from_millis(20), |step| {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut data: Vec<u8> =
+            (0..1 << 16).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
+        data[0] = step as u8;
+        data
+    });
+    // Nothing before the first checkpoint, every checkpoint saved, and more
+    // than the checkpoints once the cost was measured.
+    assert_eq!(saved.first(), Some(&10));
+    for checkpoint in [10, 20, 30, 40, 50, 60] {
+        assert!(saved.contains(&checkpoint), "checkpoint {checkpoint} not saved: {saved:?}");
+    }
+    assert!(saved.len() > 12, "the cadence never came down: {saved:?}");
+    assert!(coord.cadence().unwrap() < 10);
+
+    let snaps = coord.list_snapshots();
+    let kept: Vec<u64> = snaps.iter().map(|s| s.step).collect();
+    // The window: steps 50..=60. Older only as one of the two newest fulls -
+    // a delta's base, or the one before it for a base that will not read.
+    let fulls: Vec<u64> = snaps.iter().filter(|s| !s.is_delta).map(|s| s.step).collect();
+    let fallback = &fulls[fulls.len().saturating_sub(2)..];
+    for s in &snaps {
+        assert!(s.step >= 50 || fallback.contains(&s.step), "step {} outlived the window: {kept:?}", s.step);
+    }
+    assert!(fulls.len() >= 2, "no full to fall back on: {kept:?}");
+    assert!(kept.contains(&50) && kept.contains(&60), "{kept:?}");
+    // Deltas paid: after the rebase they are most of what is kept.
+    assert!(snaps.iter().filter(|s| s.is_delta).count() > snaps.len() / 2, "{kept:?}");
+    // Every kept checkpoint still loads.
+    for s in &snaps {
+        coord.load(s.id).unwrap();
+    }
+}
+
+/// GPU-517: when the first delta weighs a full, the store goes on with fulls.
+#[test]
+fn a_window_whose_deltas_weigh_fulls_saves_fulls() {
+    let dir = tempfile::tempdir().unwrap();
+    // Every byte changes at every step, incompressibly.
+    let (coord, _) = offer_window(dir.path(), 5, 1..=30, Duration::from_millis(5), |step| {
+        let mut x = step.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..1 << 15).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect()
+    });
+    let snaps = coord.list_snapshots();
+    let deltas = snaps.iter().filter(|s| s.is_delta).count();
+    assert!(deltas == 0, "deltas kept after one weighed a full: {:?}",
+        snaps.iter().map(|s| (s.step, s.is_delta)).collect::<Vec<_>>());
+    assert!(coord.core.retained_base.lock().unwrap().is_none());
+}
+
+#[test]
+fn a_window_is_refused_on_a_multi_rank_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let config = CoordinatorConfig {
+        world_size: 2,
+        retention: RetentionPolicy { window_steps: Some(10), ..Default::default() },
+        ..Default::default()
+    };
+    assert!(matches!(Coordinator::new(storage, config), Err(MoonclipError::Config(_))));
+}
+
+/// GPU-517: a store with a window closed and opened again, as a restart
+/// does. The cadence starts over at one save per checkpoint, retention goes
+/// on by age across the two lives, and every checkpoint kept still loads.
+#[test]
+fn a_window_store_opened_again_goes_on_where_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = |step: u64| {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut data: Vec<u8> =
+            (0..1 << 15).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
+        data[..8].copy_from_slice(&step.to_le_bytes());
+        data
+    };
+    let (first, saved) = offer_window(dir.path(), 10, 1..=45, Duration::from_millis(10), data);
+    assert!(saved.contains(&40), "{saved:?}");
+    drop(first);
+
+    let (again, saved) = offer_window(dir.path(), 10, 46..=75, Duration::from_millis(10), data);
+    assert_eq!(saved.first(), Some(&50), "a store opened again saved before its first checkpoint: {saved:?}");
+    let snaps = again.list_snapshots();
+    let steps: Vec<u64> = snaps.iter().map(|s| s.step).collect();
+    let fulls: Vec<u64> = snaps.iter().filter(|s| !s.is_delta).map(|s| s.step).collect();
+    let fallback = &fulls[fulls.len().saturating_sub(2)..];
+    let oldest_kept = steps.last().unwrap() - 10;
+    for s in &snaps {
+        assert!(s.step >= oldest_kept || fallback.contains(&s.step), "step {} outlived the window: {steps:?}", s.step);
+        let loaded = again.load(s.id).unwrap();
+        assert_eq!(&loaded["w"][..8], &s.step.to_le_bytes(), "step {} came back wrong", s.step);
+    }
+    // The last checkpoint, and whatever the cadence took after it: not
+    // necessarily step 75, under a machine busy enough to space the saves.
+    assert!(steps.contains(&70) && *steps.last().unwrap() >= 70, "{steps:?}");
 }

@@ -185,6 +185,14 @@ pub struct RetentionPolicy {
     /// If None, defaults to max_full_snapshots * (1 + max_deltas_per_full).
     #[serde(default)]
     pub max_total_snapshots: Option<usize>,
+    /// Keep the snapshots of the last this many steps, whatever their count,
+    /// and let the store choose how often to save inside them (GPU-517; see
+    /// [`crate::cadence`]). When set, the counts above are not caps: a window
+    /// holds as many saves as its cadence took, which changes from one window
+    /// to the next. `max_full_snapshots` is then the most a window may hold,
+    /// in fulls' worth of bytes.
+    #[serde(default)]
+    pub window_steps: Option<u64>,
 }
 
 impl Default for RetentionPolicy {
@@ -194,6 +202,7 @@ impl Default for RetentionPolicy {
             max_deltas_per_full: 10,
             full_snapshot_every_steps: 5000,
             max_total_snapshots: None,
+            window_steps: None,
         }
     }
 }

@@ -1,3 +1,4 @@
+pub(crate) mod cadence;
 pub mod cast;
 pub mod compression;
 pub mod coordinator;

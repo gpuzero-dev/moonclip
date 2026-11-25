@@ -521,3 +521,82 @@ fn cleanup_the_bucket() {
         uploads.len()
     );
 }
+
+/// GPU-517 against a real bucket: a store with a window syncs at each
+/// checkpoint, the bucket ends holding exactly what the store holds - the
+/// window by age and the fulls it needs, what slid out deleted there too - and
+/// a fresh store restored from it loads every step it lists.
+#[test]
+fn a_window_store_keeps_the_bucket_to_its_window() {
+    let Some(remote) = backend("it/window") else {
+        eprintln!("skipped: MOONCLIP_S3_ENDPOINT is not set");
+        return;
+    };
+
+    use moonclip::coordinator::{Coordinator, CoordinatorConfig};
+    use moonclip::manifest::{CompressionAlgo, RetentionPolicy};
+    use moonclip::remote_sync::RemoteSyncConfig;
+    use moonclip::storage::LocalStorage;
+    use moonclip::tensor::TensorData;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    let remote: Arc<dyn StorageBackend> = Arc::new(remote);
+    for key in remote.list("").unwrap() {
+        remote.delete(&key).unwrap();
+    }
+    let open = |dir: &std::path::Path| {
+        let local: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir).unwrap());
+        Coordinator::new(local, CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                full_snapshot_every_steps: 10,
+                max_deltas_per_full: 10_000,
+                window_steps: Some(5),
+                ..Default::default()
+            },
+            remote_storage: Some(Arc::clone(&remote)),
+            remote_sync: Some(RemoteSyncConfig { sync_every_n_saves: 1 }),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let coord = open(dir.path());
+    let base = noisy(1 << 16);
+    for step in 1..=32u64 {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        if coord.wants(step) {
+            let mut data = base.clone();
+            data[..8].copy_from_slice(&step.to_le_bytes());
+            coord
+                .save(step, vec![TensorData { name: "w".into(), shape: vec![data.len()], dtype: "uint8".into(), data }], HashMap::new())
+                .unwrap();
+        }
+    }
+    coord.flush().unwrap();
+    coord.sync_now().unwrap();
+    let here: HashSet<String> = coord.list_snapshots().iter().map(|s| s.id.to_string()).collect();
+    let steps: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
+    drop(coord);
+
+    let there: HashSet<String> = remote
+        .list("snapshots/")
+        .unwrap()
+        .iter()
+        .filter_map(|k| k.split('/').nth(1).map(str::to_string))
+        .collect();
+    assert_eq!(here, there, "the bucket is not the store's window: {steps:?}");
+    // The last checkpoint, and whatever the cadence took after it.
+    assert!(steps.contains(&30) && *steps.last().unwrap() >= 30, "{steps:?}");
+
+    let restored_dir = tempfile::tempdir().unwrap();
+    let restored = open(restored_dir.path());
+    assert!(restored.restore_from_remote().unwrap());
+    let snaps = restored.list_snapshots();
+    assert_eq!(snaps.iter().map(|s| s.step).collect::<Vec<_>>(), steps);
+    for s in &snaps {
+        let loaded = restored.load(s.id).unwrap();
+        assert_eq!(&loaded["w"][..8], &s.step.to_le_bytes(), "step {} came back wrong", s.step);
+    }
+}

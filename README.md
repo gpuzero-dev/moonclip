@@ -247,9 +247,11 @@ that share a store, so that none of them writes a format another cannot read.
 ## Moonclip and Ravex
 
 Moonclip is the storage layer under [Ravex](https://github.com/gpuzero-dev/ravex),
-and the line between them is that saving files is Moonclip's and the run is
-Ravex's. Moonclip decides how a checkpoint becomes files and where they go,
-bucket keys included. Ravex decides when to save and what, puts the result
+and the line between them is that Moonclip is the checkpoint manager and Ravex
+the runtime. Moonclip decides how a checkpoint becomes files and where they go,
+bucket keys included, and how often to save between two checkpoints, from what
+saving costs (`window_steps`). Ravex decides when a checkpoint is due and what
+goes in it, puts the result
 back into a live training process, and coordinates one or more machines; it
 carries no storage code of its own. To Moonclip a rank is only a number on a
 snapshot. Moonclip works on its own as well, as in the examples above.

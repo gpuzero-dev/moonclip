@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -160,6 +161,16 @@ pub struct RemoteSyncer {
     /// The steps the remote's manifest names, as this process last put it
     /// up; None before the first. See [`RemoteSyncer::remote_steps`].
     remote_steps: Arc<Mutex<Option<Vec<u64>>>>,
+    /// How long the checkpoint syncs take. See [`RemoteSyncer::upload_time`].
+    upload: Arc<Mutex<UploadClock>>,
+}
+
+/// When the checkpoint sync under way started, and how long the last one
+/// took (GPU-517).
+#[derive(Debug, Default)]
+struct UploadClock {
+    started: Option<Instant>,
+    last: Option<Duration>,
 }
 
 impl RemoteSyncer {
@@ -180,6 +191,8 @@ impl RemoteSyncer {
         let dead_worker = Arc::clone(&dead);
         let remote_steps = Arc::new(Mutex::new(None));
         let remote_steps_worker = Arc::clone(&remote_steps);
+        let upload = Arc::new(Mutex::new(UploadClock::default()));
+        let upload_worker = Arc::clone(&upload);
 
         let handle = thread::Builder::new()
             .name("moonclip-remote-sync".into())
@@ -218,9 +231,16 @@ impl RemoteSyncer {
                             }
                         }
                         SyncCommand::Checkpoint => {
+                            let started = Instant::now();
+                            upload_worker.lock().unwrap().started = Some(started);
                             let outcome = catch_unwind(AssertUnwindSafe(|| {
                                 sync_checkpoint(&local, &remote, &deletes, &remote_steps_worker)
                             }));
+                            {
+                                let mut clock = upload_worker.lock().unwrap();
+                                clock.started = None;
+                                clock.last = Some(started.elapsed());
+                            }
                             match outcome {
                                 Ok(Ok(copied)) => copied.log("snapshots"),
                                 Ok(Err(e)) => {
@@ -285,6 +305,30 @@ impl RemoteSyncer {
             sync_every,
             dead,
             remote_steps,
+            upload,
+        }
+    }
+
+    /// How long the bucket took over the last checkpoint sync, or has taken
+    /// so far over the one under way, which is the longer; None before the
+    /// first (GPU-517). Against a window's wall clock it says whether the
+    /// link carries what the window wrote: [`crate::cadence`] reads it.
+    pub fn upload_time(&self) -> Option<Duration> {
+        let clock = self.upload.lock().unwrap();
+        let going = clock.started.map(|started| started.elapsed());
+        match (going, clock.last) {
+            (Some(going), Some(last)) => Some(going.max(last)),
+            (going, last) => going.or(last),
+        }
+    }
+
+    /// Queue a checkpoint sync now, whatever the count of saves: a store
+    /// with a window syncs at each checkpoint (GPU-517). Returns at once.
+    pub fn checkpoint(&self) {
+        if let Some(ref tx) = self.sender {
+            if tx.lock().unwrap().send(SyncCommand::Checkpoint).is_err() {
+                self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -1185,6 +1229,7 @@ mod tests {
                 max_deltas_per_full: 1000,
                 full_snapshot_every_steps: 1000,
                 max_total_snapshots: keep,
+                window_steps: None,
             },
             ..Default::default()
         };
