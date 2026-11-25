@@ -70,6 +70,7 @@ class TestSaveLoad:
     def test_metadata_preserved(self, tmp_path):
         mgr = MoonclipManager(storage_root=str(tmp_path), full_every_steps=100000)
         mgr.save_tensors(step=100, tensors=make_tensors(0), metadata={"loss": "1.234", "lr": "3e-4"})
+        mgr.flush()
         snaps = mgr.list_snapshots()
         assert snaps[0]["metadata"]["loss"] == "1.234"
         assert snaps[0]["metadata"]["lr"] == "3e-4"
@@ -108,6 +109,7 @@ class TestDelta:
         tensors_v2["model.weight"] = ([64, 32], "float32", bytes(data))
         snap_id = mgr.save_tensors(step=200, tensors=tensors_v2)
 
+        mgr.flush()
         info = mgr.list_snapshots()[1]
         assert info["is_delta"] is True
         assert info["skipped_tensors"] == 2
@@ -129,6 +131,7 @@ class TestDelta:
         big_v2[50000] ^= 2
         snap_id = mgr.save_tensors(step=200, tensors={"big": ([100000], "uint8", bytes(big_v2))})
 
+        mgr.flush()
         info = mgr.list_snapshots()[1]
         assert info["delta_tensors"] == 1
         assert info["total_compressed"] < 1000
@@ -187,6 +190,7 @@ class TestDelta:
         t2 = {"a": ([100], "uint8", bytes([1] * 100)), "b": ([100], "uint8", bytes([2] * 100))}
         mgr.save_tensors(step=200, tensors=t2)
 
+        mgr.flush()
         info = mgr.list_snapshots()[1]
         assert info["skipped_tensors"] == 0, f"All tensors changed, expected 0 skipped, got {info['skipped_tensors']}"
 
@@ -212,6 +216,7 @@ class TestCompression:
         mgr = MoonclipManager(storage_root=str(tmp_path), compression_level=3, full_every_steps=100000)
         raw = struct.pack(f"{25000}f", *([0.0001] * 25000))
         mgr.save_tensors(step=1, tensors={"momentum": ([25000], "float32", raw)})
+        mgr.flush()
         info = mgr.list_snapshots()[0]
         ratio = info["total_compressed"] / info["total_raw"]
         assert ratio < 0.01
@@ -220,6 +225,7 @@ class TestCompression:
         mgr = MoonclipManager(storage_root=str(tmp_path), compression_level=0, full_every_steps=100000)
         data = bytes(range(256)) * 40
         mgr.save_tensors(step=1, tensors={"data": ([10240], "uint8", data)})
+        mgr.flush()
         info = mgr.list_snapshots()[0]
         assert info["total_compressed"] >= info["total_raw"]
 
@@ -231,6 +237,7 @@ class TestCompression:
             d = str(tmp_path / f"level_{level}")
             mgr = MoonclipManager(storage_root=d, compression_level=level, full_every_steps=100000)
             mgr.save_tensors(step=1, tensors={"w": ([100000], "uint8", data)})
+            mgr.flush()
             sizes[level] = mgr.list_snapshots()[0]["total_compressed"]
         # level 9 should be <= level 1 (may be equal for trivial data)
         assert sizes[9] <= sizes[1]
@@ -275,6 +282,7 @@ class TestSnapshotInfo:
     def test_full_save_stats(self, tmp_path):
         mgr = MoonclipManager(storage_root=str(tmp_path), full_every_steps=100000)
         mgr.save_tensors(step=100, tensors=make_tensors(0))
+        mgr.flush()
         info = mgr.list_snapshots()[0]
         assert info["step"] == 100
         assert info["full_tensors"] == 3
@@ -292,6 +300,7 @@ class TestSnapshotInfo:
         t2["model.weight"] = ([64, 32], "float32", bytes(d))
         mgr.save_tensors(step=200, tensors=t2)
 
+        mgr.flush()
         info = mgr.list_snapshots()[1]
         assert info["is_delta"] is True
         total = info["skipped_tensors"] + info["delta_tensors"] + info["full_tensors"]
@@ -371,6 +380,7 @@ class TestRetention:
         )
         for step in range(1, 10):
             mgr.save_tensors(step=step, tensors={"w": ([100], "uint8", bytes([step] * 100))})
+        mgr.flush()
         snaps = mgr.list_snapshots()
         assert len(snaps) <= 6
 

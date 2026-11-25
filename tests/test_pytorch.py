@@ -105,6 +105,7 @@ class TestCheckpointManager:
 
         snap_id = mgr.save(step=1, model=model, optimizer=optimizer)
 
+        mgr.flush()
         snaps = mgr.list_snapshots()
         assert len(snaps) == 2
         # Second save should have some skipped tensors (optimizer state not all changed)
@@ -143,6 +144,7 @@ class TestCheckpointManager:
         model[10].weight.data += 0.001
 
         snap_id = mgr.save(step=1, model=model)
+        mgr.flush()
         snaps = mgr.list_snapshots()
         info = snaps[1]
 
@@ -184,6 +186,7 @@ class TestDeltaRoundTrip:
         expected = {k: v.clone() for k, v in model.state_dict().items()}
         snap_id = mgr.save(step=1, model=model, optimizer=optimizer)
 
+        mgr.flush()
         assert mgr.list_snapshots()[1]["is_delta"] is True
         assert mgr.list_snapshots()[1]["delta_tensors"] > 0, "no delta, nothing tested"
 
@@ -242,6 +245,7 @@ class TestFlattenAsTensors:
         flat, _ = flatten_state_dict(model.state_dict(), "model", as_tensors=True)
         mgr.save_raw(step=1, tensors=flat)
 
+        mgr.flush()
         info = mgr.list_snapshots()[1]
         assert info["is_delta"] is True
         assert info["skipped_tensors"] > 15  # 10 layers x 2 params, one touched

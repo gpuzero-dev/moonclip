@@ -68,6 +68,7 @@ def main():
     dist.barrier()
 
     if rank == 0:
+        manager.flush()
         snapshots = manager.list_snapshots()
         assert len(snapshots) == 1, f"expected one snapshot, got {len(snapshots)}"
         assert snapshots[0]["ranks"] == world_size, (
@@ -112,6 +113,7 @@ def main():
     dist.barrier()
 
     if rank == 0:
+        manager.flush()
         latest = manager.list_snapshots()[-1]
         assert latest["is_delta"], "the second multi-rank save should be a delta"
         assert latest["skipped_tensors"] + latest["delta_tensors"] > 0, (
