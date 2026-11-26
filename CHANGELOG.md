@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.2 — 2026-11-27
+
+### Fixed
+
+- **A forced sync that fails deletes nothing in the bucket (GPU-530).**
+  `sync_now()`, which runs at the end of every run, preemption included,
+  used to send its queued deletes even when the upload had failed: the
+  remote manifest could still name a full checkpoint the local retention
+  had evicted, and a failed PUT left that manifest naming files that were
+  gone, so the next restore started from step 0. The deletes now wait for
+  an upload that succeeded, and stay queued otherwise.
+- **The forced sync sends the newest checkpoint first (GPU-530).** As the
+  periodic sync does: the newest snapshot and its base, then a manifest
+  naming them, then the rest of the store. On a slow link the provider's
+  SIGKILL used to come before the manifest, and the exit checkpoint was
+  lost. When that first step cannot be done (a manifest this build cannot
+  read whole), it is said and the whole store still goes up.
+- **Saving an older step drops the history the run left (GPU-530).** A run
+  resumed from an older step used to see every new save evicted by window
+  retention, which measured from the largest step, and `load_latest()`
+  returned the abandoned history. Saving a step now first drops the
+  finalized, non-pinned snapshots at or after it (keeping any base a kept
+  snapshot needs), and the window measures from the newest non-pinned
+  step. Saving out of order therefore counts as going back.
+
 ## 0.4.1 — 2026-11-25
 
 ### Changed
