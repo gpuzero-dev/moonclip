@@ -17,7 +17,7 @@ on:
     # deploy runs this file itself, through CD.yml, before it tags (GPU-443):
     # triggering it here as well would run the whole suite twice on the same
     # commit. Naming only branches also keeps a pushed tag from starting it.
-    branches-ignore: [deploy]
+    branches: [main]
   # Replay it without inventing a commit — the same reason ravex has one, and
   # for the bench the more useful trigger: re-running it on an unchanged main
   # is how you find out how much of a delta is just the runner.
