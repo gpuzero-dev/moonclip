@@ -610,7 +610,15 @@ class TestConcurrency:
         # save_tensors returns once the job is queued, not once it is written,
         # so the last save can still be in flight here.
         mgr.flush()
-        assert len(mgr.list_snapshots()) == 10
+        # Saved out of order, a step drops what was saved after it (GPU-530),
+        # so how many survive depends on the order the threads ran in: what
+        # must hold is a history in step order that no save changes after
+        # flush returned.
+        steps = [s["step"] for s in mgr.list_snapshots()]
+        assert steps and steps == sorted(set(steps)), steps
+        time.sleep(0.02)
+        mgr.flush()
+        assert [s["step"] for s in mgr.list_snapshots()] == steps
 
 
 # ─── S3 backend validation ──────────────────────────────────────────

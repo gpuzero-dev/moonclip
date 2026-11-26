@@ -809,7 +809,10 @@ impl Core {
         if let Some(ref cadence) = self.cadence {
             cadence.writing(save_started);
         }
-        let manifest = self.lock_manifest();
+        let mut manifest = self.lock_manifest();
+        // Before the base is chosen: a base from the history this save leaves
+        // behind would be dropped with it.
+        let abandoned = self.drop_abandoned(&mut manifest, step)?;
         let force_full = manifest.should_force_full(step)
             || self.cadence.as_ref().is_some_and(|c| c.wants_full());
         let base_snap = if force_full {
@@ -824,6 +827,13 @@ impl Core {
             .as_ref()
             .map(|b| self.in_flight.pin(std::slice::from_ref(&b.id)));
         drop(manifest);
+        crate::merger::unlink_snapshots(
+            &self.storage,
+            &self.pending_deletes,
+            &self.in_flight,
+            &abandoned,
+            crate::inflight::RETENTION_UNLINK_WAIT,
+        );
 
         let created_at = Utc::now();
         let context = SnapshotContext {
@@ -922,7 +932,10 @@ impl Core {
         // the single-rank path: it will not exist by the time anyone loads the
         // delta written against it. Rank 0 chooses for every rank here, so
         // getting it wrong costs the whole snapshot rather than one shard.
-        let manifest = self.lock_manifest();
+        let mut manifest = self.lock_manifest();
+        // Rank 0 alone, when the step begins, so that every rank's shard is
+        // written against the history this step continues (GPU-530).
+        let abandoned = self.drop_abandoned(&mut manifest, step)?;
         let force_full = manifest.should_force_full(step);
         let base_id = if force_full {
             None
@@ -933,6 +946,13 @@ impl Core {
                 .map(|s| s.id)
         };
         drop(manifest);
+        crate::merger::unlink_snapshots(
+            &self.storage,
+            &self.pending_deletes,
+            &self.in_flight,
+            &abandoned,
+            crate::inflight::RETENTION_UNLINK_WAIT,
+        );
 
         let snapshot = Snapshot {
             pinned: false,
@@ -2201,7 +2221,15 @@ impl Core {
         // window with one full in it dropped the other.
         if let Some(window) = manifest.retention.window_steps {
             // The newest is never a candidate, so it holds through the loop.
-            let newest = manifest.snapshots.iter().filter(|s| s.finalized).map(|s| s.step).max();
+            // Not a pinned one: a pin can outlive a rewind past it (see
+            // `Core::drop_abandoned`), and measured from it the window
+            // evicted every step the resumed run saved (GPU-530).
+            let newest = manifest
+                .snapshots
+                .iter()
+                .filter(|s| s.finalized && !s.pinned)
+                .map(|s| s.step)
+                .max();
             let oldest_kept = newest.unwrap_or(0).saturating_sub(window);
             let fallback: Vec<Uuid> = manifest
                 .snapshots
@@ -2341,6 +2369,55 @@ impl Core {
             .map(|s| s.id)
             .collect();
         self.remove_snapshots(manifest, &to_remove)
+    }
+
+    /// Drop the history a save of `step` leaves behind: every finalised
+    /// snapshot at `step` or later (GPU-530). Persisted, and handed back for
+    /// the caller to unlink once the lock is gone, as retention's are.
+    ///
+    /// A run resumed from an earlier step saves steps the store already has
+    /// newer than. Left in place, that abandoned future was the newest the
+    /// window measured from, so each save after the resume was evicted by
+    /// its own retention pass, and `load_latest` went back to the abandoned
+    /// step. Dropped, the manifest is again in step order, which is what
+    /// retention, `last_full_snapshot` and the rollback ids assume.
+    ///
+    /// A pinned snapshot stays - someone holds it on purpose, a fork reading
+    /// it - and so does a full that a kept snapshot is computed against.
+    /// Unfinalised ones are not judged here: another rank may be writing one.
+    ///
+    /// shortcut: a full merge already under way over the abandoned history
+    /// still publishes its result, at a step past this one; the next save
+    /// drops it like the rest. Upgrade by having the merge check, before it
+    /// publishes, that its base is still in the manifest.
+    fn drop_abandoned(&self, manifest: &mut Manifest, step: u64) -> Result<Vec<Snapshot>> {
+        self.sync_pins(manifest)?;
+        let mut abandoned: Vec<Uuid> = manifest
+            .snapshots
+            .iter()
+            .filter(|s| s.finalized && !s.pinned && s.step >= step)
+            .map(|s| s.id)
+            .collect();
+        let bases: Vec<Uuid> = manifest
+            .snapshots
+            .iter()
+            .filter(|s| !abandoned.contains(&s.id))
+            .filter_map(|s| s.base_snapshot_id)
+            .collect();
+        abandoned.retain(|id| !bases.contains(id));
+        if abandoned.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Published before anything is unlinked, and the old list put back if
+        // that fails, as the merger does: the manifest must never name files
+        // that are gone, nor stop naming files that are not.
+        let previous = manifest.snapshots.clone();
+        let dropped = self.remove_snapshots(manifest, &abandoned)?;
+        if let Err(e) = self.persist_manifest(manifest) {
+            manifest.snapshots = previous;
+            return Err(e);
+        }
+        Ok(dropped)
     }
 
     /// Drop these snapshots from the manifest and hand their descriptions back

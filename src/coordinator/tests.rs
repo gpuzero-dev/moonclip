@@ -425,10 +425,20 @@ fn concurrent_saves_all_land() {
         }
         coord.flush().unwrap();
 
+        // Saved out of order, a step drops what was saved after it (GPU-530),
+        // so how many survive depends on the order the threads ran in. What
+        // a lost update shows is a save landing after `flush` returned: the
+        // list changes once the worker has had time to finish it.
+        let steps = |c: &Coordinator| c.list_snapshots().iter().map(|s| s.step).collect::<Vec<_>>();
+        let flushed = steps(&coord);
+        assert!(!flushed.is_empty(), "trial {trial}: no save landed");
+        assert!(flushed.windows(2).all(|w| w[0] < w[1]), "trial {trial}: {flushed:?}");
+        thread::sleep(std::time::Duration::from_millis(20));
+        coord.flush().unwrap();
         assert_eq!(
-            coord.list_snapshots().len(),
-            THREADS as usize,
-            "trial {trial}: a concurrent save is missing from the manifest"
+            steps(&coord),
+            flushed,
+            "trial {trial}: a concurrent save landed after flush returned"
         );
     }
 }
@@ -3494,4 +3504,71 @@ fn listing_does_not_wait_for_the_save_in_flight() {
     coord.flush().unwrap();
     let listed: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
     assert_eq!(listed, vec![1, 2]);
+}
+
+/// GPU-530: a run resumed from an earlier step saves steps the store already
+/// has newer than. The history it left behind goes, but for what is pinned:
+/// the window measures from the steps saved since, keeps them, and
+/// `load_latest` is the newest of them. Each save after the rewind was
+/// evicted by its own retention pass, and `load_latest` went back to the
+/// abandoned step.
+#[test]
+fn a_rewound_run_keeps_what_it_saves_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        Coordinator::new(storage, CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                full_snapshot_every_steps: 10,
+                max_deltas_per_full: 10,
+                window_steps: Some(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        }).unwrap()
+    };
+    let data = |step: u64| {
+        let mut data = vec![7u8; 4096];
+        data[..8].copy_from_slice(&step.to_le_bytes());
+        data
+    };
+    let save = |coord: &Coordinator, step: u64| {
+        let bytes = data(step);
+        coord.save(step, vec![TensorData {
+            name: "w".into(), shape: vec![bytes.len()], dtype: "uint8".into(), data: bytes,
+        }], HashMap::new()).unwrap();
+    };
+
+    let first = open();
+    for step in 0..=50 {
+        save(&first, step);
+    }
+    first.flush().unwrap();
+    assert!(first.pin(45).unwrap());
+    drop(first);
+
+    // Resumed at step 4, in a new process.
+    let resumed = open();
+    for step in 5..=14 {
+        save(&resumed, step);
+    }
+    resumed.flush().unwrap();
+
+    let steps: Vec<u64> = resumed.list_snapshots().iter().map(|s| s.step).collect();
+    for step in 5..=14 {
+        assert!(steps.contains(&step), "step {step} saved after the rewind is gone: {steps:?}");
+    }
+    assert_eq!(
+        steps.iter().filter(|&&s| s > 14).collect::<Vec<_>>(),
+        vec![&45],
+        "the abandoned history is still there, or the pinned step is not: {steps:?}"
+    );
+    let (id, latest) = resumed.load_latest().unwrap();
+    assert_eq!(latest["w"], data(14), "load_latest is not the newest step saved since");
+    assert_eq!(resumed.list_snapshots().iter().find(|s| s.id == id).unwrap().step, 14);
+    // Every snapshot listed still loads, the pinned one and its base included.
+    for snap in resumed.list_snapshots() {
+        assert_eq!(resumed.load(snap.id).unwrap()["w"], data(snap.step), "step {}", snap.step);
+    }
 }
