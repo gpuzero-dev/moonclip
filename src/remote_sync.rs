@@ -710,7 +710,14 @@ fn sync_all(
     // link the provider's SIGKILL came first, and that checkpoint was lost.
     // The deletes `sync_checkpoint` sends are only of what the manifest it
     // has just put up does not name.
-    sync_checkpoint(local, remote, deletes, remote_steps)?.log("snapshots");
+    // A newest checkpoint that cannot be told or put up first - a manifest
+    // this build does not read whole, a PUT refused - is said and does not
+    // stop the sync: the whole store still goes up below, as it always did,
+    // and the deletes still wait for that to succeed.
+    match sync_checkpoint(local, remote, deletes, remote_steps) {
+        Ok(outcome) => outcome.log("snapshots"),
+        Err(e) => eprintln!("[Moonclip sync] The newest checkpoint did not go first: {}", e),
+    }
     sync_store(local, remote)?;
     // After the upload, never before: a key queued for deletion is already
     // gone locally, so the upload above cannot have put it back.
