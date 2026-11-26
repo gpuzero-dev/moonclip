@@ -688,8 +688,8 @@ fn put_up(
     Ok(Some(kept.snapshots.iter().map(|s| s.step).collect()))
 }
 
-/// The forced sync behind [`RemoteSyncer::sync_now`]: the whole store, then
-/// the deletes the window queued.
+/// The forced sync behind [`RemoteSyncer::sync_now`]: the newest checkpoint,
+/// then the whole store, then the deletes the window queued.
 ///
 /// The deletes only once the upload succeeded (GPU-530). A key queued for
 /// deletion is gone from this disk, but the manifest the remote holds can
@@ -704,6 +704,13 @@ fn sync_all(
     deletes: &Arc<PendingDeletes>,
     remote_steps: &Mutex<Option<Vec<u64>>>,
 ) -> Result<()> {
+    // The newest checkpoint and a manifest naming it first, as the periodic
+    // sync does (GPU-530). The whole store in listing order put the exit
+    // checkpoint's manifest behind every other file: on a SIGTERM over a slow
+    // link the provider's SIGKILL came first, and that checkpoint was lost.
+    // The deletes `sync_checkpoint` sends are only of what the manifest it
+    // has just put up does not name.
+    sync_checkpoint(local, remote, deletes, remote_steps)?.log("snapshots");
     sync_store(local, remote)?;
     // After the upload, never before: a key queued for deletion is already
     // gone locally, so the upload above cannot have put it back.
@@ -1831,6 +1838,60 @@ mod tests {
         // `whole_on` checks that every file the manifest names is still there.
         assert_eq!(whole_on(&dst), before);
         assert!(!deletes.keys.lock().unwrap().is_empty(), "the deletes were dropped, not kept for the next sync");
+    }
+
+    /// A remote that refuses every write after the first manifest: a forced
+    /// sync killed as soon as the first manifest is up.
+    struct DiesAfterManifest {
+        inner: Arc<dyn StorageBackend>,
+        dead: std::sync::atomic::AtomicBool,
+    }
+
+    impl StorageBackend for DiesAfterManifest {
+        fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+            if self.dead.load(Ordering::SeqCst) {
+                return Err(MoonclipError::Storage(format!("killed before {rel_path}")));
+            }
+            self.inner.put(rel_path, data)?;
+            if rel_path == MANIFEST {
+                self.dead.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+            self.inner.get(rel_path)
+        }
+        fn exists(&self, rel_path: &str) -> Result<bool> {
+            self.inner.exists(rel_path)
+        }
+        fn delete(&self, rel_path: &str) -> Result<()> {
+            self.inner.delete(rel_path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    /// GPU-530. The forced sync puts up the newest checkpoint and a manifest
+    /// naming it before the rest of the store: killed right after that first
+    /// manifest, the remote resumes from the newest step. In listing order
+    /// the manifest came after every other file, and a SIGKILL on a slow link
+    /// lost the exit checkpoint.
+    #[test]
+    fn a_forced_sync_puts_up_the_newest_checkpoint_first() {
+        let (_a, _b, local, dst) = two_stores();
+        saved(&local, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        local.put(".ravex-owner", b"{}").unwrap();
+        let remote: Arc<dyn StorageBackend> = Arc::new(DiesAfterManifest {
+            inner: Arc::clone(&dst),
+            dead: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        assert!(sync_all(&local, &remote, &nothing_deleted(), &Mutex::new(None)).is_err());
+
+        let named = whole_on(&dst);
+        assert_eq!(named.iter().max(), Some(&8), "the remote does not resume from the newest: {named:?}");
+        assert!(named.len() < 8, "the whole store went up before the first manifest: {named:?}");
     }
 
     /// A store is not only its manifest and its snapshots. Ravex writes an
