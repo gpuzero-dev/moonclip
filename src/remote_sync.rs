@@ -258,26 +258,7 @@ impl RemoteSyncer {
                             // than a dropped sender the caller has to infer
                             // something from.
                             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                                let result = sync_store(&local, &remote);
-                                // After the upload, never before: a key queued
-                                // for deletion is already gone locally, so the
-                                // upload above cannot have put it back.
-                                apply_deletes(&remote, &deletes);
-                                if result.is_ok() {
-                                    // The whole store went up, so the remote
-                                    // now holds every step this disk does
-                                    // (GPU-422).
-                                    if let Ok(Some(manifest)) = manifest_io::load(local.as_ref(), None) {
-                                        let steps = manifest
-                                            .snapshots
-                                            .iter()
-                                            .filter(|s| s.finalized)
-                                            .map(|s| s.step)
-                                            .collect();
-                                        *remote_steps_worker.lock().unwrap() = Some(steps);
-                                    }
-                                }
-                                result
+                                sync_all(&local, &remote, &deletes, &remote_steps_worker)
                             }));
                             let outcome = match outcome {
                                 Ok(Ok(())) => None,
@@ -705,6 +686,40 @@ fn put_up(
     deletes.restore(waiting);
     deletes.restore(delete_all(remote, gone));
     Ok(Some(kept.snapshots.iter().map(|s| s.step).collect()))
+}
+
+/// The forced sync behind [`RemoteSyncer::sync_now`]: the whole store, then
+/// the deletes the window queued.
+///
+/// The deletes only once the upload succeeded (GPU-530). A key queued for
+/// deletion is gone from this disk, but the manifest the remote holds can
+/// still name it - a full the window evicted here while the remote's manifest
+/// stood on it. A sync that failed before its manifest went up leaves that
+/// manifest in place, and deleting the files it names left a bucket whose
+/// checkpoint did not load: the run restarted from step 0. Kept, they are
+/// asked for again at the next sync.
+fn sync_all(
+    local: &Arc<dyn StorageBackend>,
+    remote: &Arc<dyn StorageBackend>,
+    deletes: &Arc<PendingDeletes>,
+    remote_steps: &Mutex<Option<Vec<u64>>>,
+) -> Result<()> {
+    sync_store(local, remote)?;
+    // After the upload, never before: a key queued for deletion is already
+    // gone locally, so the upload above cannot have put it back.
+    apply_deletes(remote, deletes);
+    // The whole store went up, so the remote now holds every step this disk
+    // does (GPU-422).
+    if let Ok(Some(manifest)) = manifest_io::load(local.as_ref(), None) {
+        let steps = manifest
+            .snapshots
+            .iter()
+            .filter(|s| s.finalized)
+            .map(|s| s.step)
+            .collect();
+        *remote_steps.lock().unwrap() = Some(steps);
+    }
+    Ok(())
 }
 
 /// Copy a whole store from one side to the other, manifest last.
@@ -1788,6 +1803,34 @@ mod tests {
             !dst.exists(MANIFEST).unwrap_or(false),
             "nothing claims the destination holds a checkpoint"
         );
+    }
+
+    /// GPU-530. A forced sync whose manifest did not go up sends none of the
+    /// deletes the window queued: the remote's manifest still names the files
+    /// this disk evicted, and deleting them left a bucket whose checkpoint
+    /// did not load.
+    #[test]
+    fn a_failed_forced_sync_deletes_nothing_the_remote_still_names() {
+        let (_a, _b, local, dst) = two_stores();
+        saved_with(&local, &[1, 2, 3], Some(2));
+        sync_store(&local, &dst).unwrap();
+        let before = whole_on(&dst);
+        let first: HashSet<String> = dst.list("snapshots").unwrap().into_iter().collect();
+
+        // The window moves on and evicts here what the remote's manifest names.
+        saved_with(&local, &[4, 5], Some(2));
+        let deletes = Arc::new(PendingDeletes::default());
+        for file in first.iter().filter(|f| local.get(f).is_err()) {
+            deletes.push(file.clone());
+        }
+        assert!(!deletes.keys.lock().unwrap().is_empty());
+
+        let remote: Arc<dyn StorageBackend> = Arc::new(RecordingRemote::refusing(Arc::clone(&dst), MANIFEST));
+        assert!(sync_all(&local, &remote, &deletes, &Mutex::new(None)).is_err());
+
+        // `whole_on` checks that every file the manifest names is still there.
+        assert_eq!(whole_on(&dst), before);
+        assert!(!deletes.keys.lock().unwrap().is_empty(), "the deletes were dropped, not kept for the next sync");
     }
 
     /// A store is not only its manifest and its snapshots. Ravex writes an
