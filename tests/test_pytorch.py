@@ -659,6 +659,92 @@ class TestUnflattenStateDict:
         assert unflatten_state_dict({"loose/tensor": b"\x00\x01"}) == {}
 
 
+
+class _Planted:
+    """What a writer of the store could plant in a checkpoint: unpickling it
+    calls ``open`` and creates a file. Restoring must never get that far."""
+
+    def __init__(self, marker):
+        self.marker = marker
+
+    def __reduce__(self):
+        return (open, (self.marker, "w"))
+
+
+class TestRestoreRunsNoCode:
+    """GPU-538: the non-tensor part of a checkpoint is read as plain data."""
+
+    def test_a_planted_object_is_refused_and_never_runs(self, tmp_path):
+        from moonclip import unflatten_state_dict
+        from moonclip.pytorch import UnsafeCheckpoint
+
+        marker = tmp_path / "ran"
+        raw = {"optimizer._metadata": pickle.dumps({"state": _Planted(str(marker))})}
+        with pytest.raises(UnsafeCheckpoint, match=r"optimizer\._metadata.*\.open, which"):
+            unflatten_state_dict(raw)
+        assert not marker.exists()
+
+    def test_the_describing_path_refuses_it_too(self, tmp_path):
+        from moonclip import describe_state_dict
+        from moonclip.pytorch import UnsafeCheckpoint
+
+        marker = tmp_path / "ran"
+        with pytest.raises(UnsafeCheckpoint):
+            describe_state_dict({"model._metadata": pickle.dumps([_Planted(str(marker))])})
+        assert not marker.exists()
+
+    def test_a_whole_pickled_state_dict_is_refused(self):
+        from moonclip import unflatten_state_dict
+        from moonclip.pytorch import UnsafeCheckpoint
+
+        with pytest.raises(UnsafeCheckpoint, match="first versions"):
+            unflatten_state_dict({"optimizer._blob": pickle.dumps({"lr": 0.1})})
+
+    def test_schedulers_scaler_and_rng_state_still_round_trip(self, tmp_path):
+        """The state a resume needs, through the restricted reader: LambdaLR
+        and OneCycleLR, a GradScaler, and Python's and NumPy's RNG state."""
+        import random
+
+        np = pytest.importorskip("numpy")
+        from moonclip import flatten_state_dict, unflatten_state_dict
+
+        model = torch.nn.Linear(8, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        lam = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 0.5**step)
+        one = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.1, total_steps=10)
+        scaler = torch.amp.GradScaler("cpu", init_scale=1024.0)
+        model(torch.randn(2, 8)).sum().backward()
+        optimizer.step()
+        lam.step()
+        one.step()
+        states = {
+            "optimizer": optimizer.state_dict(),
+            "lambda": lam.state_dict(),
+            "onecycle": one.state_dict(),
+            "scaler": scaler.state_dict(),
+            "rng": {"python": random.getstate(), "numpy": np.random.get_state()},
+        }
+        raw = {}
+        for prefix, state in states.items():
+            tensors, _ = flatten_state_dict(state, prefix, as_tensors=True)
+            for name, value in tensors.items():
+                # Bytes, as a store hands every entry back.
+                raw[name] = (
+                    value[2]
+                    if name.endswith("._metadata")
+                    else value.detach().reshape(-1).contiguous().view(torch.uint8).numpy().tobytes()
+                )
+        rebuilt = unflatten_state_dict(raw)
+
+        assert rebuilt["lambda"]["last_epoch"] == lam.state_dict()["last_epoch"]
+        assert rebuilt["onecycle"]["total_steps"] == 10
+        assert rebuilt["scaler"]["scale"] == scaler.state_dict()["scale"]
+        assert rebuilt["rng"]["python"] == random.getstate()
+        kind, keys, *rest = rebuilt["rng"]["numpy"]
+        assert kind == "MT19937"
+        assert np.array_equal(keys, np.random.get_state()[1])
+        assert rebuilt["optimizer"]["param_groups"][0]["lr"] == optimizer.param_groups[0]["lr"]
+
 class TestPerComponentSaveDtype:
     """`save_dtype` chosen per tensor name.
 

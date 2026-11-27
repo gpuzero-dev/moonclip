@@ -276,6 +276,71 @@ def _tensor_from_raw(shape, dtype_str: str, raw) -> "torch.Tensor":
     return torch.frombuffer(buf, dtype=dtype).reshape(shape).clone()
 
 
+#: The globals the non-tensor part of a checkpoint may name (GPU-538). That
+#: part - the structure of each state dict, optimizer and scheduler scalars,
+#: RNG state - is written with ``pickle``, and an unrestricted ``pickle.loads``
+#: of it would run whatever code a writer of the store put there. Restoring
+#: reads it with :class:`_CheckpointUnpickler`, which builds only plain data:
+#: the primitives pickle has opcodes for, these containers, torch's ``Size``,
+#: ``device`` and dtypes, and NumPy arrays and dtypes for NumPy's RNG state.
+_SAFE_GLOBALS = frozenset(
+    {
+        ("collections", "OrderedDict"),
+        ("builtins", "set"),
+        ("builtins", "frozenset"),
+        ("builtins", "complex"),
+        ("torch", "Size"),
+        ("torch", "device"),
+        ("numpy", "ndarray"),
+        ("numpy", "dtype"),
+        ("numpy.core.multiarray", "_reconstruct"),
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("numpy.core.multiarray", "scalar"),
+        ("numpy._core.multiarray", "scalar"),
+    }
+)
+
+
+class UnsafeCheckpoint(pickle.UnpicklingError):
+    """The non-tensor part of a checkpoint names something restoring will not
+    build (GPU-538): a class or function outside :data:`_SAFE_GLOBALS`, which
+    an unrestricted unpickle would have imported and called."""
+
+
+class _CheckpointUnpickler(pickle.Unpickler):
+    def __init__(self, data: bytes, where: str):
+        import io
+
+        super().__init__(io.BytesIO(data))
+        self._where = where
+
+    def find_class(self, module: str, name: str) -> Any:
+        if (module, name) in _SAFE_GLOBALS:
+            return super().find_class(module, name)
+        # torch pickles a dtype as the global it is (``torch.float32``).
+        if module == "torch" and isinstance(getattr(torch, name, None), torch.dtype):
+            return getattr(torch, name)
+        # NumPy 2 pickles an array's dtype through its class in numpy.dtypes.
+        if module == "numpy.dtypes" and name.endswith("DType"):
+            import numpy
+
+            found = getattr(numpy.dtypes, name, None)
+            if isinstance(found, type) and issubclass(found, numpy.dtype):
+                return found
+        raise UnsafeCheckpoint(
+            f"{self._where}: the checkpoint names {module}.{name}, which a checkpoint "
+            "may not contain: restoring it would run code from the store. Only plain "
+            "data, torch dtypes and NumPy arrays are read back (GPU-538)."
+        )
+
+
+def _loads(data: bytes, where: str) -> Any:
+    """``pickle.loads`` for the non-tensor part of a checkpoint, restricted to
+    plain data (:class:`_CheckpointUnpickler`). There is no unrestricted
+    fallback: something it refuses fails the restore, saying what and where."""
+    return _CheckpointUnpickler(bytes(data), where).load()
+
+
 def _reconstruct_from_tensors(meta: Any, tensors_in: dict) -> Any:
     """
     Recursively walks meta (the template structure).
@@ -530,22 +595,23 @@ def unflatten_state_dict(raw: dict) -> Dict[str, Any]:
         Prefixes with no recoverable structure are left out rather than
         guessed at.
 
-    Two shapes are read, because two were written. A ``<prefix>._blob`` entry
-    is a whole pickled state dict, which is what optimizer and scheduler state
-    became once storing their scalars as individual tensors turned out to cost
-    more in manifest entries than it saved. A ``<prefix>._metadata`` entry is
-    the older per-tensor form, still what model weights use, where the pickle
-    holds the tree with placeholders and the tensors are separate entries —
-    which is the form that makes per-tensor delta tracking possible at all.
-
-    A prefix carrying both is read as a blob: that is the newer writer, and it
-    is self-contained.
+    A ``<prefix>._metadata`` entry holds the tree with placeholders, and the
+    tensors are separate entries - the form that makes per-tensor delta
+    tracking possible at all. The tree is read with :func:`_loads`, which
+    builds plain data only (GPU-538). A ``<prefix>._blob`` entry, a whole
+    state dict pickled with its tensors inside as the first versions wrote
+    it, is refused with :class:`UnsafeCheckpoint`: reading it would mean
+    running code from the store.
     """
     result: Dict[str, Any] = {}
 
-    for key, value in raw.items():
+    for key in raw:
         if key.endswith("._blob"):
-            result[key[: -len("._blob")]] = pickle.loads(value)
+            raise UnsafeCheckpoint(
+                f"{key}: this checkpoint holds a whole state dict as one pickle, the form "
+                "the first versions wrote, and reading it back would run code from the "
+                "store. Save again from a run on this version (GPU-538)."
+            )
 
     for key, value in raw.items():
         if not key.endswith("._metadata"):
@@ -553,7 +619,7 @@ def unflatten_state_dict(raw: dict) -> Dict[str, Any]:
         prefix = key[: -len("._metadata")]
         if prefix in result:
             continue
-        result[prefix] = _reconstruct_from_tensors(pickle.loads(value), raw)
+        result[prefix] = _reconstruct_from_tensors(_loads(value, key), raw)
 
     return result
 
@@ -644,7 +710,7 @@ def describe_state_dict(raw: dict) -> Dict[str, Any]:
     for key, value in raw.items():
         if not key.endswith("._metadata"):
             continue
-        result[key[: -len("._metadata")]] = _stub_from_tensors(pickle.loads(value))
+        result[key[: -len("._metadata")]] = _stub_from_tensors(_loads(value, key))
     return result
 
 
@@ -764,8 +830,7 @@ class CheckpointManager:
             Each tensor (exp_avg, exp_avg_sq, ...) goes to Rust directly:
             hashing and compression run in parallel per tensor and nothing
             large is pickled. Only the non-tensor skeleton is pickled into
-            "<prefix>._metadata". Checkpoints saved by older versions as a
-            single "<prefix>._blob" are still loadable.
+            "<prefix>._metadata", read back with ``_loads`` (GPU-538).
             """
             sd = obj.state_dict() if hasattr(obj, "state_dict") else obj
             counter = [0]

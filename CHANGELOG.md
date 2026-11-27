@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **Restoring no longer runs code from the checkpoint (GPU-538).** The
+  non-tensor part of a checkpoint was read with an unrestricted
+  `pickle.loads`, so whoever could write to the store could run code in the
+  process that resumed. It is now read by an unpickler that builds plain
+  data, torch dtypes and NumPy arrays only, and fails with `UnsafeCheckpoint`
+  on anything else. The `<prefix>._blob` form the first versions wrote is
+  refused. Checkpoints whose state dicts are stored as `<prefix>._metadata`,
+  the form every recent version writes, read as before.
+
 ## 0.4.2 — 2026-11-27
 
 ### Fixed

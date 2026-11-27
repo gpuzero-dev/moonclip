@@ -17,11 +17,17 @@ is released as a new version, never backported.
 
 ## What to know before you rely on it
 
-- **Restoring runs code from the checkpoint.** Part of a checkpoint
-  (optimizer and scheduler state, the metadata of each state dict) is
-  unpickled. Whoever can write to the store's directory or bucket can
-  therefore run code in the process that restores from it. Give write access
-  only to what you would let run code on your training machines.
+- **Restoring builds plain data only (GPU-538).** The non-tensor part of a
+  checkpoint (optimizer and scheduler scalars, the structure of each state
+  dict, RNG state) is written with `pickle`, and read back by an unpickler
+  that builds only the primitives pickle encodes directly, `OrderedDict`,
+  `set`, `frozenset`, `complex`, torch's `Size`, `device` and dtypes, and
+  NumPy arrays and dtypes (for NumPy's RNG state). Anything else fails the
+  restore with `moonclip.pytorch.UnsafeCheckpoint`, naming the entry and what
+  it held; there is no unrestricted fallback. A `<prefix>._blob` entry, the
+  whole-state-dict pickle the first versions wrote, is refused the same way.
+  Write access to the store still decides what a resume trains on, so give
+  it only to what you trust with your runs.
 - Bucket credentials are read from the environment, a profile in
   `~/.aws/credentials` or the machine's role, and are never written to the
   store or to a log. Keep keys out of command lines.
