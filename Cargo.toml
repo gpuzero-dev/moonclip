@@ -62,9 +62,9 @@ ureq = "3"
 # checksum headers. Its signing only: the answers are read here. `url` and
 # `jiff` are the types the signing takes, so `jiff` stays on the major
 # rusty-s3 builds with (0.2 for rusty-s3 0.11), not the latest one.
-rusty-s3 = { version = "0.11.0", default-features = false, features = ["rustcrypto"] }
+rusty-s3 = { version = "0.12.0", default-features = false, features = ["rustcrypto"] }
 url = "2"
-jiff = { version = "0.2", default-features = false, features = ["std"] }
+jiff = { version = "1.0", default-features = false, features = ["std"] }
 # SigV4 in the Authorization header, for the one request a presigned URL
 # cannot make: a listing with temporary credentials on R2 (GPU-217). The
 # versions rusty-s3 already brings, so nothing new is built.
